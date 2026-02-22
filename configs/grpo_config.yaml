@@ -1,0 +1,11 @@
+model:
+  name: ""
+
+training:
+  learning_rate: 1e-5
+  batch_size: 8
+  epochs: 3
+  group_size: 4        # number of responses sampled per prompt for relative scoring
+
+grpo:
+  kl_coef: 0.1

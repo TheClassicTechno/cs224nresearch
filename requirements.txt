@@ -1,0 +1,4 @@
+google-genai>=1.64.0
+python-dotenv>=1.2.1
+jupyter
+notebook
