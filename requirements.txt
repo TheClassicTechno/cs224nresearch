@@ -6,3 +6,5 @@ tqdm>=4.65.0
 datasets>=2.14.0
 jupyter
 notebook
+datasets
+huggingface_hub
