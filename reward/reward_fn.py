@@ -9,7 +9,7 @@ class RewardConfig:
     gamma: float = 0.3
     n_samples_train: int = 1
     n_samples_eval: int = 3
-    judge_model: str = "gpt-4o-mini"
+    judge_model: str = "gemini-1.5-flash"
     cache_dir: str = ".judge_cache"
     def label(self) -> str:
         return "factual_only" if self.mode == "factual_only" else f"truth_weighted_gamma{self.gamma}"

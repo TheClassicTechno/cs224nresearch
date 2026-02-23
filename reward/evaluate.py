@@ -194,7 +194,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model_path", required=True, help="HuggingFace checkpoint dir")
     p.add_argument("--eval_set", required=True, help="Path to eval_set.json")
     p.add_argument("--output", required=True, help="Path to save scored results JSON")
-    p.add_argument("--judge_model", default="gpt-4o-mini")
+    p.add_argument("--judge_model", default="gemini-1.5-flash")
     p.add_argument("--device", default="cuda")
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--max_new_tokens", type=int, default=256)

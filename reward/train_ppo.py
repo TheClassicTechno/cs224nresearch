@@ -230,7 +230,7 @@ def run_all_ablations(
     output_dir: str = "results",
     device: str = "cuda",
     skip_training: bool = False,
-    judge_model: str = "gpt-4o-mini",
+    judge_model: str = "gemini-1.5-flash",
     **train_kwargs,
 ) -> None:
     """Train all four reward ablations and evaluate each on the eval set.
@@ -315,7 +315,7 @@ def _build_parser() -> argparse.ArgumentParser:
     t.add_argument("--kl_coef", type=float, default=0.2)
     t.add_argument("--max_new_tokens", type=int, default=256)
     t.add_argument("--device", default="cuda")
-    t.add_argument("--judge_model", default="gpt-4o-mini")
+    t.add_argument("--judge_model", default="gemini-1.5-flash")
 
 
     a = sub.add_parser("ablate", help="Run all four reward ablations")
@@ -326,7 +326,7 @@ def _build_parser() -> argparse.ArgumentParser:
     a.add_argument("--device", default="cuda")
     a.add_argument("--skip_training", action="store_true",
                    help="Skip training; only evaluate existing checkpoints")
-    a.add_argument("--judge_model", default="gpt-4o-mini")
+    a.add_argument("--judge_model", default="gemini-1.5-flash")
     a.add_argument("--num_epochs", type=int, default=1)
     a.add_argument("--batch_size", type=int, default=8)
     a.add_argument("--learning_rate", type=float, default=1.5e-5)

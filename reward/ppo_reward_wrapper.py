@@ -147,7 +147,7 @@ class PPORewardWrapper:
             gamma=config.get("gamma", 0.3),
             n_samples_train=config.get("n_samples_train", 1),
             n_samples_eval=config.get("n_samples_eval", 3),
-            judge_model=config.get("judge_model", "gpt-4o-mini"),
+            judge_model=config.get("judge_model", "gemini-1.5-flash"),
             cache_dir=config.get("cache_dir", ".judge_cache"),
         )
         return cls(reward_config=rc, tokenizer=tokenizer)

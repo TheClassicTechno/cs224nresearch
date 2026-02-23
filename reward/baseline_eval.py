@@ -17,7 +17,7 @@ def run_sft_baseline(
     output_dir: str = "results",
     device: str = "cuda",
     batch_size: int = 8,
-    judge_model: str = "gpt-4o-mini",
+    judge_model: str = "gemini-1.5-flash",
 ) -> EvalMetrics:
     """Evaluate the SFT checkpoint and save results.
 
@@ -138,7 +138,7 @@ def _build_parser() -> argparse.ArgumentParser:
     b.add_argument("--output_dir", default="results")
     b.add_argument("--device", default="cuda")
     b.add_argument("--batch_size", type=int, default=8)
-    b.add_argument("--judge_model", default="gpt-4o-mini")
+    b.add_argument("--judge_model", default="gemini-1.5-flash")
 
     # compare sub-command
     c = sub.add_parser("compare", help="Compare all models in a results directory")
