@@ -1,0 +1,17 @@
+# SFT configuration for Qwen3-1.7B
+hf_repo_id: TheClassicTechno/qwen3-1.7b-sft-medquad
+model_name: Qwen/Qwen3-1.7B
+# Dataset split must match HF dataset; mli5/medquad-sycophancy has 'train' only
+data_path: hf:mli5/medquad-sycophancy:train
+output_dir: sft_qwen3_ckpt
+# Reduce batch_size to avoid OOM 
+batch_size: 2
+gradient_accumulation_steps: 2
+epochs: 2
+lr: 2e-5
+max_length: 1024
+use_lora: true
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.05
+device: cuda
