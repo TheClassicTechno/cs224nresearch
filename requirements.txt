@@ -8,3 +8,6 @@ jupyter
 notebook
 datasets
 huggingface_hub
+
+
+wandb
