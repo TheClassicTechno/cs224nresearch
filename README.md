@@ -1,5 +1,5 @@
 # cs224nresearch
-
+Juli Huang, Michael Li, Jillian Chang
 ## Setup
 
 1. Create the conda environment (first time only):
