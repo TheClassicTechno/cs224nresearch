@@ -1,2 +1,5 @@
 .env
+/local_runs
 *.jsonl
+*__pycache__
+*.claude

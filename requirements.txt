@@ -1,13 +1,10 @@
 google-genai>=1.64.0
 python-dotenv>=1.2.1
-transformers>=4.30.0
-torch>=2.0.0
-tqdm>=4.65.0
-datasets>=2.14.0
 jupyter
 notebook
 datasets
 huggingface_hub
-
-
 wandb
+python-dotenv
+torch
+accelerate
