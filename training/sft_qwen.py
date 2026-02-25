@@ -6,7 +6,7 @@
 import os
 import argparse
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer, DataCollatorForLanguageModeling
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer, default_data_collator
 from datasets import load_dataset, Dataset
 import yaml
 
@@ -21,15 +21,15 @@ def load_sft_data(data_path):
         #  mli5/medquad-sycophancy uses new_question, answer
         cols = ds.column_names
         if "prompt" in cols and "response" in cols:
-            filtered = ds.filter(lambda ex: ex.get("split") == "rl_train" and ex.get("prompt_condition") in {"neutral", "misconception", "correct-belief"})
+            filtered = ds.filter(lambda ex: ex.get("split") == "rl_train" and ex.get("prompt_condition") in {"neutral", "misconception", "correct_belief"})
             return filtered
         if "new_question" in cols and "answer" in cols:
             ds = ds.rename_columns({"new_question": "prompt", "answer": "response"})
-            filtered = ds.filter(lambda ex: ex.get("split") == "rl_train" and ex.get("prompt_condition") in {"neutral", "misconception", "correct-belief"})
+            filtered = ds.filter(lambda ex: ex.get("split") == "rl_train" and ex.get("prompt_condition") in {"neutral", "misconception", "correct_belief"})
             return filtered
         if "question" in cols and "answer" in cols:
             ds = ds.rename_columns({"question": "prompt", "answer": "response"})
-            filtered = ds.filter(lambda ex: ex.get("split") == "rl_train" and ex.get("prompt_condition") in {"neutral", "misconception", "correct-belief"})
+            filtered = ds.filter(lambda ex: ex.get("split") == "rl_train" and ex.get("prompt_condition") in {"neutral", "misconception", "correct_belief"})
             return filtered
         raise ValueError(
             f"Dataset {ds_name} must have 'prompt' and 'response' columns (or 'new_question'/'answer', or 'question'/'answer'). "
@@ -50,15 +50,27 @@ def load_sft_data(data_path):
         raise ValueError("Unsupported data format: must be .json, .jsonl, or 'hf:dataset:split'")
 
 def preprocess(example, tokenizer, max_length=1024):
-    # Concatenate prompt and response 
-    text = example["prompt"] + example["response"]
+    prompt = example["prompt"]
+    response = example["response"]
+
+    # Tokenize prompt alone to find how many tokens to mask
+    prompt_ids = tokenizer(prompt, truncation=True, max_length=max_length, add_special_tokens=False)["input_ids"]
+    prompt_len = len(prompt_ids)
+
+    # Tokenize full text
     enc = tokenizer(
-        text,
+        prompt + response,
         truncation=True,
         max_length=max_length,
         padding="max_length",
     )
-    enc["labels"] = enc["input_ids"].copy()
+
+    labels = enc["input_ids"].copy()
+    # Mask prompt tokens and padding tokens — loss computed on response only
+    for i in range(len(labels)):
+        if i < prompt_len or labels[i] == tokenizer.pad_token_id:
+            labels[i] = -100
+    enc["labels"] = labels
     return enc
 
 def main():
@@ -142,8 +154,9 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True, torch_dtype=torch.bfloat16)
     model = model.to(device)
+    model.config.use_cache = False
 
     if use_lora and (str(use_lora).lower() == "true" or use_lora is True):
         try:
@@ -159,6 +172,7 @@ def main():
             task_type=TaskType.CAUSAL_LM,
         )
         model = get_peft_model(model, lora_config)
+        model.enable_input_require_grads()  # required for LoRA + gradient checkpointing
         print("LoRA enabled.")
 
     # Reduce activation memory
@@ -172,7 +186,7 @@ def main():
         remove_columns=dataset.column_names,
     )
 
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    data_collator = default_data_collator
 
     training_args = TrainingArguments(
         output_dir=output_dir,
@@ -207,7 +221,6 @@ def main():
         wandb.finish()
     # Save as .pth file 
     try:
-        import torch
         torch.save(model.state_dict(), os.path.join(output_dir, "pytorch_model.pth"))
         print(f"Saved PyTorch .pth weights to {os.path.join(output_dir, 'pytorch_model.pth')}")
     except Exception as e:
@@ -231,7 +244,7 @@ def main():
             )
             print(f"Model pushed to https://huggingface.co/{repo_id}")
         except Exception as e:
-            print(f"[Warning] Could not push to Hugging Face Hub: {e}")
+            raise RuntimeError(f"HF Hub push failed: {e}") from e
 
 if __name__ == "__main__":
     main()
