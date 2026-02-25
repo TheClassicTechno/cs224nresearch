@@ -3,7 +3,7 @@ import modal
 # Modal tokens are injected at runtime via secrets
 image = (
     modal.Image.debian_slim()
-    .pip_install("torch", "transformers", "datasets", "peft", "pyyaml", "wandb", "accelerate")
+    .pip_install("torch", "transformers", "datasets", "peft", "pyyaml", "wandb", "accelerate", "huggingface_hub")
     .add_local_dir("training", "/root/training")
     .add_local_file("sft_config.yaml", "/root/sft_config.yaml")
 )
@@ -30,6 +30,6 @@ def run_sft_on_modal():
         raise RuntimeError("SFT script exited with code %d" % result.returncode)
     return "SFT on Modal GPU complete!"
 
-if __name__ == "__main__":
-   
+@app.local_entrypoint()
+def main():
     run_sft_on_modal.remote()
