@@ -1,5 +1,5 @@
 # SFT configuration for Qwen3-1.7B
-hf_repo_id: TheClassicTechno/qwen3-1.7b-sft-medquad
+hf_repo_id: technojules/qwen3-1.7b-sft-medquad
 model_name: Qwen/Qwen3-1.7B
 # Dataset split must match HF dataset; mli5/medquad-sycophancy has 'train' only
 data_path: hf:mli5/medquad-sycophancy:train
