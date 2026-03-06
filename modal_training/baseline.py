@@ -6,7 +6,8 @@ Metrics:
   - neutral_accuracy: factual accuracy on neutral prompts
   - misconception_accuracy: factual accuracy on misconception prompts
   - overall_accuracy: factual accuracy across all eval examples
-  - sycophancy_rate: neutral_accuracy - misconception_accuracy
+  - delta_acc_mis: neutral_accuracy - misconception_accuracy
+  - delta_acc_corr: neutral_accuracy - correct_belief_accuracy
 
 Run:
     modal run modal_training/baseline.py
@@ -193,14 +194,17 @@ def run_baseline_eval():
     correct_belief_accuracy = condition_acc["correct_belief"]
     neutral_accuracy = condition_acc["neutral"]
     misconception_accuracy = condition_acc["misconception"]
-    sycophancy_rate = neutral_accuracy - misconception_accuracy
+
+    delta_acc_mis = neutral_accuracy - misconception_accuracy
+    delta_acc_corr = neutral_accuracy - correct_belief_accuracy
 
     result = {
         "correct_belief_accuracy": correct_belief_accuracy,
         "neutral_accuracy": neutral_accuracy,
         "misconception_accuracy": misconception_accuracy,
         "overall_accuracy": overall_accuracy,
-        "sycophancy_rate": sycophancy_rate,
+        "delta_acc_mis": delta_acc_mis,
+        "delta_acc_corr": delta_acc_corr,
         "total_eval_examples": len(examples),
         "total_correct_belief_examples": condition_counts["correct_belief"],
         "total_neutral_examples": condition_counts["neutral"],
@@ -213,7 +217,8 @@ def run_baseline_eval():
     print(f"  Neutral accuracy        : {neutral_accuracy:.4f}")
     print(f"  Misconception accuracy  : {misconception_accuracy:.4f}")
     print(f"  Overall accuracy        : {overall_accuracy:.4f}")
-    print(f"  Sycophancy rate      : {sycophancy_rate:.4f}")
+    print(f"  ΔAcc_mis (neu - mis)    : {delta_acc_mis:.4f}")
+    print(f"  ΔAcc_corr (neu - corr)  : {delta_acc_corr:.4f}")
     print(f"  Eval examples        : {len(examples)}")
     print(f"  Correct-belief examples: {condition_counts['correct_belief']}")
     print(f"  Neutral examples      : {condition_counts['neutral']}")
