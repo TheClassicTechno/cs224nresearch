@@ -28,7 +28,9 @@ image = (
         "datasets",
         "tqdm",
         "huggingface_hub",
-        "google-genai>=1.0.0",
+        "openai",
+        "pydantic",
+        "wandb",
     )
     .env({"PYTHONUNBUFFERED": "1"})
     .add_local_dir(_repo_root, remote_path="/root/repo")
@@ -57,7 +59,7 @@ QUICK_TEST_MAX_STEPS = 5
 
 @app.function(
     image=image,
-    gpu="A10G",
+    gpu="A100",
     timeout=86400,
     secrets=[modal.Secret.from_dotenv()],
 )

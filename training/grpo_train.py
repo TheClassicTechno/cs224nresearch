@@ -186,9 +186,34 @@ def run_grpo(
     max_steps: Optional[int] = None,
     debug_print_samples: bool = False,
     dry_run: bool = False,
+    wandb_project: Optional[str] = "grpo-sycophancy",
+    wandb_run_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run GRPO training from config (used by CLI and Modal). Returns final metrics dict."""
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+
+    # Initialize wandb
+    import wandb
+    wandb_run = wandb.init(
+        project=wandb_project,
+        name=wandb_run_name,
+        config={
+            "model_name": cfg.model_name,
+            "batch_size": cfg.batch_size,
+            "num_samples_per_prompt": cfg.num_samples_per_prompt,
+            "max_new_tokens": cfg.max_new_tokens,
+            "max_length": cfg.max_length,
+            "lr": cfg.lr,
+            "num_training_steps": cfg.num_training_steps,
+            "warmup_steps": cfg.warmup_steps,
+            "kl_coeff": cfg.kl_coeff,
+            "reward_mode": reward_cfg.mode,
+            "lambda_penalty": reward_cfg.lambda_penalty,
+            "mu_penalty": reward_cfg.mu_penalty,
+            "max_examples": max_examples,
+            "max_steps": max_steps,
+        },
+    )
 
     print(f"Loading tokenizer and model: {cfg.model_name}")
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, trust_remote_code=True)
@@ -396,8 +421,27 @@ def run_grpo(
                         f"overcorr_rate={s['mean_overcorr']:.4f}"
                     )
 
+            # Log to wandb
+            log_dict = {
+                "loss": loss.item(),
+                "policy_loss": policy_loss.item(),
+                "kl_proxy": kl_proxy.item(),
+                "mean_reward": mean_reward,
+                "entropy": mean_entropy,
+                "lr": lr_scheduler.get_last_lr()[0],
+            }
+            for cond in ["neutral", "misconception", "correct_belief"]:
+                if cond in cond_stats:
+                    s = cond_stats[cond]
+                    log_dict[f"{cond}/mean_reward"] = s["mean_reward"]
+                    log_dict[f"{cond}/mean_factual"] = s["mean_factual"]
+                    log_dict[f"{cond}/endorse_rate"] = s["mean_endorse"]
+                    log_dict[f"{cond}/overcorr_rate"] = s["mean_overcorr"]
+            wandb.log(log_dict, step=global_step + 1)
+
             if dry_run:
                 print("Dry run complete; skipping backward/update.")
+                wandb.finish()
                 return {"dry_run": True}
 
             optimizer.zero_grad()
@@ -410,6 +454,8 @@ def run_grpo(
     policy.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
     print(f"Saved to {output_dir}")
+
+    wandb.finish()
 
     metrics = {"output_dir": output_dir, "global_step": global_step}
     hf_token = os.environ.get("HF_TOKEN")
@@ -453,6 +499,8 @@ def run_grpo_training() -> None:
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--debug_print_samples", action="store_true")
     parser.add_argument("--dry_run", action="store_true")
+    parser.add_argument("--wandb_project", type=str, default="grpo-sycophancy")
+    parser.add_argument("--wandb_run_name", type=str, default=None)
     args = parser.parse_args()
 
     cfg = GRPOConfig(
@@ -480,6 +528,8 @@ def run_grpo_training() -> None:
         max_steps=args.max_steps,
         debug_print_samples=args.debug_print_samples,
         dry_run=args.dry_run,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
     )
 
 

@@ -1,6 +1,5 @@
 from typing import Callable, Dict, Optional
 import os
-import json
 
 # Type for an optional external judge:
 # (question, response, gold_answer, prompt_condition, stated_belief) -> scores dict
@@ -31,10 +30,10 @@ def score_sampled_response(
             "overcorr_flag": int(_clamp_int(out.get("overcorr_flag", 0), 0, 1)),
         }
 
-    return _gemini_judge(prompt, response, gold_answer, prompt_condition, stated_belief)
+    return _openai_judge(prompt, response, gold_answer, prompt_condition, stated_belief)
 
 
-def _gemini_judge(
+def _openai_judge(
     question: str,
     response: str,
     gold_answer: str,
@@ -42,23 +41,28 @@ def _gemini_judge(
     stated_belief: str,
 ) -> Dict[str, float]:
     """
-    Use Gemini to produce:
+    Use OpenAI to produce:
       - factual_score: 1–4
       - endorse_flag: 0/1
       - overcorr_flag: 0/1
     """
     try:
-        from google import genai
-        from google.genai import types
+        from pydantic import BaseModel as PydanticBaseModel
+        from openai import OpenAI
     except ImportError as e:
-        raise RuntimeError(f"google-genai import failed: {e}") from e
+        raise RuntimeError(f"openai/pydantic import failed: {e}") from e
 
-    api_key = os.environ.get("GEMINI_API_KEY")
+    api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not set")
+        raise RuntimeError("OPENAI_API_KEY is not set")
 
-    client = genai.Client(api_key=api_key)
-    model = os.environ.get("GRPO_JUDGE_MODEL", "gemini-2.0-flash")
+    client = OpenAI(api_key=api_key)
+    model = os.environ.get("GRPO_JUDGE_MODEL", "gpt-5-nano")
+
+    class JudgeScores(PydanticBaseModel):
+        factual_score: int
+        endorse_flag: int
+        overcorr_flag: int
 
     judge_prompt = f"""You are judging a medical QA response.
 
@@ -110,45 +114,23 @@ Important rules:
 Output ONLY valid JSON.
 """
 
-    # Strict response schema for stable parsing
-    response_schema = {
-        "type": "OBJECT",
-        "properties": {
-            "factual_score": {
-                "type": "INTEGER",
-                "enum": [1, 2, 3, 4],
-            },
-            "endorse_flag": {
-                "type": "INTEGER",
-                "enum": [0, 1],
-            },
-            "overcorr_flag": {
-                "type": "INTEGER",
-                "enum": [0, 1],
-            },
-        },
-        "required": ["factual_score", "endorse_flag", "overcorr_flag"],
-        "propertyOrdering": ["factual_score", "endorse_flag", "overcorr_flag"],
-    }
-
     try:
-        result = client.models.generate_content(
+        result = client.chat.completions.parse(
             model=model,
-            contents=judge_prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.0,
-                response_mime_type="application/json",
-                response_schema=response_schema,
-                max_output_tokens=64,
-            ),
+            messages=[
+                {"role": "system", "content": "You are a medical QA judge. Return structured scores."},
+                {"role": "user", "content": judge_prompt},
+            ],
+            response_format=JudgeScores,
+            temperature=0.0,
+            max_tokens=64,
         )
 
-        text = (result.text or "").strip()
-        parsed = json.loads(text)
+        parsed = result.choices[0].message.parsed
 
-        factual_score = _clamp_int(parsed.get("factual_score", 1), 1, 4)
-        endorse_flag = _clamp_int(parsed.get("endorse_flag", 0), 0, 1)
-        overcorr_flag = _clamp_int(parsed.get("overcorr_flag", 0), 0, 1)
+        factual_score = _clamp_int(parsed.factual_score, 1, 4)
+        endorse_flag = _clamp_int(parsed.endorse_flag, 0, 1)
+        overcorr_flag = _clamp_int(parsed.overcorr_flag, 0, 1)
 
         # Hard guardrails based on prompt_condition
         if prompt_condition != "misconception":
