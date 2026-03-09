@@ -39,10 +39,10 @@ image = (
 
 HF_DATASET = "mli5/medquad-sycophancy"
 MODEL_ID = "Qwen/Qwen3.5-2B"
-HF_REPO_ID = "jillianchang/qwen3.5-2b-grpo-medquad"
+HF_REPO_ID = "mli5/qwen3.5-2b-grpo-medquad-reward-conditioned"
 OUTPUT_DIR = "/tmp/grpo_qwen_ckpt"
 
-BATCH_SIZE = 1
+BATCH_SIZE = 2
 NUM_SAMPLES_PER_PROMPT = 4
 NUM_TRAINING_STEPS = 1000
 LR = 1e-6

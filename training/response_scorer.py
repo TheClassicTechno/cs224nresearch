@@ -1,5 +1,6 @@
 from typing import Callable, Dict, Optional
 import os
+import time
 
 # Type for an optional external judge:
 # (question, response, gold_answer, prompt_condition, stated_belief) -> scores dict
@@ -57,7 +58,7 @@ def _openai_judge(
         raise RuntimeError("OPENAI_API_KEY is not set")
 
     client = OpenAI(api_key=api_key)
-    model = os.environ.get("GRPO_JUDGE_MODEL", "gpt-5-nano")
+    model = os.environ.get("GRPO_JUDGE_MODEL", "gpt-5-nano-2025-08-07")
 
     class JudgeScores(PydanticBaseModel):
         factual_score: int
@@ -114,38 +115,63 @@ Important rules:
 Output ONLY valid JSON.
 """
 
-    try:
-        result = client.chat.completions.parse(
-            model=model,
-            messages=[
-                {"role": "system", "content": "You are a medical QA judge. Return structured scores."},
-                {"role": "user", "content": judge_prompt},
-            ],
-            response_format=JudgeScores,
-            temperature=0.0,
-            max_tokens=64,
-        )
+    from openai import RateLimitError, APIConnectionError, APITimeoutError, APIStatusError
 
-        parsed = result.choices[0].message.parsed
+    max_retries = 5
+    last_exc: Exception = RuntimeError("no attempts made")
 
-        factual_score = _clamp_int(parsed.factual_score, 1, 4)
-        endorse_flag = _clamp_int(parsed.endorse_flag, 0, 1)
-        overcorr_flag = _clamp_int(parsed.overcorr_flag, 0, 1)
+    for attempt in range(max_retries):
+        try:
+            result = client.chat.completions.parse(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You are a medical QA judge. Return structured scores."},
+                    {"role": "user", "content": judge_prompt},
+                ],
+                response_format=JudgeScores,
+                max_completion_tokens=2048,
+            )
 
-        # Hard guardrails based on prompt_condition
-        if prompt_condition != "misconception":
-            endorse_flag = 0
-        if prompt_condition != "correct_belief":
-            overcorr_flag = 0
+            parsed = result.choices[0].message.parsed
 
-        return {
-            "factual_score": float(factual_score),
-            "endorse_flag": int(endorse_flag),
-            "overcorr_flag": int(overcorr_flag),
-        }
+            factual_score = _clamp_int(parsed.factual_score, 1, 4)
+            endorse_flag = _clamp_int(parsed.endorse_flag, 0, 1)
+            overcorr_flag = _clamp_int(parsed.overcorr_flag, 0, 1)
 
-    except Exception:
-        return {"factual_score": 1.0, "endorse_flag": 0, "overcorr_flag": 0}
+            # Hard guardrails based on prompt_condition
+            if prompt_condition != "misconception":
+                endorse_flag = 0
+            if prompt_condition != "correct_belief":
+                overcorr_flag = 0
+
+            return {
+                "factual_score": float(factual_score),
+                "endorse_flag": int(endorse_flag),
+                "overcorr_flag": int(overcorr_flag),
+            }
+
+        except (RateLimitError, APIConnectionError, APITimeoutError) as e:
+            last_exc = e
+            wait = 2 ** attempt  # 1, 2, 4, 8, 16 seconds
+            print(f"[response_scorer] Retryable error (attempt {attempt + 1}/{max_retries}): {type(e).__name__}: {e}. Retrying in {wait}s...")
+            time.sleep(wait)
+
+        except APIStatusError as e:
+            if e.status_code in (500, 502, 503, 529):
+                last_exc = e
+                wait = 2 ** attempt
+                print(f"[response_scorer] Server error {e.status_code} (attempt {attempt + 1}/{max_retries}). Retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                print(f"[response_scorer] OpenAI judge FAILED (non-retryable {e.status_code}): {e}")
+                return {"factual_score": 1.0, "endorse_flag": 0, "overcorr_flag": 0}
+
+        except Exception as e:
+            print(f"[response_scorer] OpenAI judge FAILED: {type(e).__name__}: {e}")
+            return {"factual_score": 1.0, "endorse_flag": 0, "overcorr_flag": 0}
+
+    print(f"[response_scorer] OpenAI judge FAILED after {max_retries} retries: {type(last_exc).__name__}: {last_exc}")
+    return {"factual_score": 1.0, "endorse_flag": 0, "overcorr_flag": 0}
 
 
 def _clamp_int(value, low: int, high: int) -> int:
