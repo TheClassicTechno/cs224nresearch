@@ -7,6 +7,7 @@ standardized advantages for a KL-regularized policy-gradient update.
 import argparse
 import os
 from dataclasses import dataclass
+import math
 from typing import List, Optional, Dict, Any
 
 import torch
@@ -223,6 +224,8 @@ def run_grpo(
     output_dir: str,
     hf_repo_id: Optional[str] = None,
     max_examples: Optional[int] = None,
+    sample_randomly: bool = False,
+    sample_seed: int = 42,
     max_steps: Optional[int] = None,
     debug_print_samples: bool = False,
     dry_run: bool = False,
@@ -259,6 +262,8 @@ def run_grpo(
             "lora_alpha": cfg.lora_alpha,
             "beta_kl": cfg.beta_kl,
             "max_examples": max_examples,
+            "sample_randomly": sample_randomly,
+            "sample_seed": sample_seed,
             "max_steps": max_steps,
         },
     )
@@ -313,24 +318,28 @@ def run_grpo(
         policy.print_trainable_parameters()
         print("Policy loaded with LoRA adapter.")
 
-        # ── 4. Load frozen reference policy (SFT checkpoint, for KL regularization) ──
+        # ── 4. Load frozen reference policy (reserved for KL regularization) ──
         print(f"Loading frozen reference model: {cfg.model_name}")
-        ref_policy = AutoModelForCausalLM.from_pretrained(
+        _ref_policy = AutoModelForCausalLM.from_pretrained(
             cfg.model_name,
             dtype=torch.bfloat16,
             device_map="auto",
             trust_remote_code=True,
             token=hf_token,
         )
-        ref_policy.eval()
-        for p in ref_policy.parameters():
+        _ref_policy.eval()
+        for p in _ref_policy.parameters():
             p.requires_grad_(False)
         print("Reference model loaded (frozen).")
 
         # ── 5. Load dataset ──────────────────────────────────────────────────
         ds = _get_dataset(cfg)
         if max_examples is not None:
-            ds = ds.select(range(min(max_examples, len(ds))))
+            sample_size = min(max_examples, len(ds))
+            if sample_randomly:
+                ds = ds.shuffle(seed=sample_seed).select(range(sample_size))
+            else:
+                ds = ds.select(range(sample_size))
         print(f"Loaded {len(ds)} training examples after filtering.")
 
         dl = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True)
@@ -348,6 +357,21 @@ def run_grpo(
         )
 
         global_step = 0
+        steps_per_epoch = max(1, math.ceil(len(ds) / cfg.batch_size))
+        approx_epochs = target_steps / steps_per_epoch
+
+        if max_examples is not None:
+            sampling_desc = (
+                f"random subset of {len(ds)} examples (seed={sample_seed})"
+                if sample_randomly
+                else f"first {len(ds)} examples"
+            )
+            print(f"Training on {sampling_desc}.")
+        print(
+            "Target optimizer steps="
+            f"{target_steps} (~{approx_epochs:.2f} passes over the selected dataset, "
+            f"{steps_per_epoch} steps/pass)."
+        )
 
         while global_step < target_steps:
             for batch in dl:
@@ -588,6 +612,7 @@ def run_grpo_training() -> None:
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--num_samples_per_prompt", type=int, default=4)
     parser.add_argument("--num_training_steps", type=int, default=1000)
+    parser.add_argument("--warmup_steps", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-6)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--reward_mode", type=str, default="condition_aware",
@@ -597,6 +622,8 @@ def run_grpo_training() -> None:
     parser.add_argument("--data_path", type=str, default=None)
     parser.add_argument("--hf_repo_id", type=str, default=None)
     parser.add_argument("--max_examples", type=int, default=None)
+    parser.add_argument("--sample_randomly", action="store_true")
+    parser.add_argument("--sample_seed", type=int, default=42)
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--debug_print_samples", action="store_true")
     parser.add_argument("--dry_run", action="store_true")
@@ -611,6 +638,7 @@ def run_grpo_training() -> None:
         batch_size=args.batch_size,
         num_samples_per_prompt=args.num_samples_per_prompt,
         num_training_steps=args.num_training_steps,
+        warmup_steps=args.warmup_steps,
         lr=args.lr,
         device=args.device,
     )
@@ -625,6 +653,8 @@ def run_grpo_training() -> None:
         output_dir=args.output_dir,
         hf_repo_id=args.hf_repo_id,
         max_examples=args.max_examples,
+        sample_randomly=args.sample_randomly,
+        sample_seed=args.sample_seed,
         max_steps=args.max_steps,
         debug_print_samples=args.debug_print_samples,
         dry_run=args.dry_run,
