@@ -12,6 +12,7 @@ from typing import List, Optional, Dict, Any
 import torch
 from datasets import load_dataset, Dataset
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
 
 from .reward import RewardConfig, compute_reward
@@ -184,7 +185,7 @@ def run_grpo(
     hf_repo_id: Optional[str] = None,
     max_examples: Optional[int] = None,
     max_steps: Optional[int] = None,
-    debug_print_samples: bool = False,
+    debug_print_samples: bool = False,  # noqa: ARG001 — kept for API compatibility
     dry_run: bool = False,
     wandb_project: Optional[str] = "grpo-sycophancy",
     wandb_run_name: Optional[str] = None,
@@ -194,7 +195,7 @@ def run_grpo(
 
     # Initialize wandb
     import wandb
-    wandb_run = wandb.init(
+    wandb.init(
         project=wandb_project,
         name=wandb_run_name,
         config={
@@ -247,6 +248,7 @@ def run_grpo(
     global_step = 0
     target_steps = max_steps if max_steps is not None else cfg.num_training_steps
 
+    pbar = tqdm(total=target_steps, desc="GRPO", unit="step")
     while global_step < target_steps:
         for batch in dl:
             if global_step >= target_steps:
@@ -341,14 +343,6 @@ def run_grpo(
                         factual_score_norm = (fs - 1.0) / 3.0 if 1.0 <= fs <= 4.0 else fs
                     factual_score_norm = max(0.0, min(1.0, _to_float(factual_score_norm, 0.0)))
 
-                    if debug_print_samples and global_step < 2:
-                        print("\n" + "=" * 80)
-                        print(f"PROMPT TYPE: {ptype}")
-                        print(f"PROMPT: {q}")
-                        print(f"SAMPLE {k}: {response_text}")
-                        print(f"SCORES: {scores}")
-                        print(f"REWARD_DICT: {r_dict}")
-
                     group_rewards.append(reward_value)
 
                     reward_records.append(
@@ -401,25 +395,12 @@ def run_grpo(
             mean_reward = rewards_tensor.mean().item()
             cond_stats = _aggregate_condition_stats(reward_records)
 
-            print(
-                f"[step {global_step + 1}] "
-                f"loss={loss.item():.4f} "
-                f"policy_loss={policy_loss.item():.4f} "
-                f"kl_proxy={kl_proxy.item():.4f} "
-                f"mean_reward={mean_reward:.4f} "
-                f"entropy={mean_entropy:.4f}"
+            pbar.set_postfix(
+                loss=f"{loss.item():.3f}",
+                reward=f"{mean_reward:.3f}",
+                kl=f"{kl_proxy.item():.3f}",
+                ent=f"{mean_entropy:.3f}",
             )
-            for cond in ["neutral", "misconception", "correct_belief"]:
-                if cond in cond_stats:
-                    s = cond_stats[cond]
-                    print(
-                        f"  [{cond}] "
-                        f"n={int(s['count'])} "
-                        f"mean_reward={s['mean_reward']:.4f} "
-                        f"mean_factual={s['mean_factual']:.4f} "
-                        f"endorse_rate={s['mean_endorse']:.4f} "
-                        f"overcorr_rate={s['mean_overcorr']:.4f}"
-                    )
 
             # Log to wandb
             log_dict = {
@@ -440,6 +421,7 @@ def run_grpo(
             wandb.log(log_dict, step=global_step + 1)
 
             if dry_run:
+                pbar.close()
                 print("Dry run complete; skipping backward/update.")
                 wandb.finish()
                 return {"dry_run": True}
@@ -450,7 +432,9 @@ def run_grpo(
             optimizer.step()
             lr_scheduler.step()
             global_step += 1
+            pbar.update(1)
 
+    pbar.close()
     policy.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
     print(f"Saved to {output_dir}")
