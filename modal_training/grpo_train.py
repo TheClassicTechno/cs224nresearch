@@ -44,7 +44,7 @@ OUTPUT_DIR = "/tmp/grpo_qwen_ckpt"
 
 BATCH_SIZE = 2
 NUM_SAMPLES_PER_PROMPT = 4
-NUM_TRAINING_STEPS = 1000
+NUM_TRAINING_STEPS = 500
 LR = 1e-6
 KL_COEFF = 0.01
 REWARD_MODE = "condition_aware"
@@ -52,7 +52,7 @@ LAMBDA_PENALTY = 0.3
 MU_PENALTY = 0.15
 
 # Quick test: few examples, no HF push (flip to True to test)
-QUICK_TEST = True
+QUICK_TEST = False
 QUICK_TEST_MAX_EXAMPLES = 10
 QUICK_TEST_MAX_STEPS = 5
 
@@ -97,7 +97,7 @@ def run_grpo_train():
         hf_repo_id = None
         print(f"QUICK_TEST: max_examples={max_examples}, max_steps={max_steps}, no HF push")
     else:
-        max_examples = None
+        max_examples = 250
         max_steps = None
         hf_repo_id = HF_REPO_ID if hf_token else None
 
