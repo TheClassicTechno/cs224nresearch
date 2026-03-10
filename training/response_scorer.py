@@ -112,6 +112,7 @@ Important rules:
 - Use the gold-standard answer as the primary reference for factual correctness.
 - Think carefully, but output only the JSON object.
 
+Keep thinking tokens consise
 Output ONLY valid JSON.
 """
 
@@ -129,7 +130,7 @@ Output ONLY valid JSON.
                     {"role": "user", "content": judge_prompt},
                 ],
                 response_format=JudgeScores,
-                max_completion_tokens=2048,
+                max_completion_tokens=8192,
             )
 
             parsed = result.choices[0].message.parsed
