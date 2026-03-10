@@ -12,13 +12,16 @@ from typing import List, Optional, Dict, Any
 import torch
 from datasets import load_dataset, Dataset
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
 
 from .reward import RewardConfig, compute_reward
-from .response_scorer import score_sampled_response
+from .response_scorer import score_sampled_response, validate_openai_key
 
 VALID_CONDITIONS = {"neutral", "misconception", "correct_belief"}
+
+# Save a local checkpoint every N steps; push to HF every M steps.
+CHECKPOINT_EVERY_N_STEPS = 100
+HF_PUSH_EVERY_N_STEPS = 250
 
 
 def load_grpo_data(data_path: str, rl_split: str = "rl_train") -> Dataset:
@@ -83,7 +86,7 @@ def load_grpo_data(data_path: str, rl_split: str = "rl_train") -> Dataset:
 
 @dataclass
 class GRPOConfig:
-    model_name: str = "Qwen/Qwen3-1.7B"
+    model_name: str = "technojules/qwen3.5-2b-sft-medquad"
     data_path: Optional[str] = None
     hf_dataset: str = "mli5/medquad-sycophancy"
     split: str = "train"
@@ -95,9 +98,13 @@ class GRPOConfig:
     lr: float = 1e-6
     num_training_steps: int = 1000
     warmup_steps: int = 100
-    kl_coeff: float = 0.01
     log_interval: int = 10
     device: str = "cuda"
+    # LoRA settings (applied to policy only; ref_policy stays frozen base model)
+    lora_r: int = 64
+    lora_alpha: int = 128
+    lora_dropout: float = 0.05
+    beta_kl: float = 0.01              # KL penalty weight vs frozen reference policy
 
 
 def _get_dataset(cfg: GRPOConfig) -> Dataset:
@@ -178,6 +185,38 @@ def _aggregate_condition_stats(records: List[Dict[str, Any]]) -> Dict[str, Dict[
     return stats
 
 
+def _save_checkpoint(
+    policy,
+    tokenizer,
+    output_dir: str,
+    step: int,
+    hf_repo_id: Optional[str],
+    hf_token: Optional[str],
+) -> None:
+    """Save LoRA adapter locally and optionally push to HF Hub."""
+    ckpt_dir = os.path.join(output_dir, f"checkpoint-{step}")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    policy.save_pretrained(ckpt_dir)
+    tokenizer.save_pretrained(ckpt_dir)
+    print(f"[checkpoint] Saved to {ckpt_dir}")
+
+    if hf_repo_id and hf_token:
+        try:
+            from huggingface_hub import HfApi, login
+            login(token=hf_token)
+            api = HfApi()
+            api.create_repo(repo_id=hf_repo_id, exist_ok=True)
+            api.upload_folder(
+                folder_path=ckpt_dir,
+                repo_id=hf_repo_id,
+                repo_type="model",
+                path_in_repo=f"checkpoint-{step}",
+            )
+            print(f"[checkpoint] Pushed checkpoint-{step} to https://huggingface.co/{hf_repo_id}")
+        except Exception as e:
+            print(f"[checkpoint] WARNING: HF push failed at step {step}: {e}")
+
+
 def run_grpo(
     cfg: GRPOConfig,
     reward_cfg: RewardConfig,
@@ -185,17 +224,23 @@ def run_grpo(
     hf_repo_id: Optional[str] = None,
     max_examples: Optional[int] = None,
     max_steps: Optional[int] = None,
-    debug_print_samples: bool = False,  # noqa: ARG001 — kept for API compatibility
+    debug_print_samples: bool = False,
     dry_run: bool = False,
     wandb_project: Optional[str] = "grpo-sycophancy",
     wandb_run_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run GRPO training from config (used by CLI and Modal). Returns final metrics dict."""
-    device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
 
-    # Initialize wandb
+    # ── 0. Validate API keys before loading the model ────────────────────────
+    validate_openai_key()
+
+    device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+    hf_token = os.environ.get("HF_TOKEN")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # ── 1. Initialize wandb ──────────────────────────────────────────────────
     import wandb
-    wandb.init(
+    wandb_run = wandb.init(
         project=wandb_project,
         name=wandb_run_name,
         config={
@@ -207,271 +252,343 @@ def run_grpo(
             "lr": cfg.lr,
             "num_training_steps": cfg.num_training_steps,
             "warmup_steps": cfg.warmup_steps,
-            "kl_coeff": cfg.kl_coeff,
             "reward_mode": reward_cfg.mode,
             "lambda_penalty": reward_cfg.lambda_penalty,
             "mu_penalty": reward_cfg.mu_penalty,
+            "lora_r": cfg.lora_r,
+            "lora_alpha": cfg.lora_alpha,
+            "beta_kl": cfg.beta_kl,
             "max_examples": max_examples,
             "max_steps": max_steps,
         },
     )
 
-    print(f"Loading tokenizer and model: {cfg.model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    policy = AutoModelForCausalLM.from_pretrained(cfg.model_name, trust_remote_code=True)
-    policy.to(device)
-    policy.train()
+    try:
+        # ── 2. Load tokenizer ────────────────────────────────────────────────
+        print(f"Loading tokenizer and model: {cfg.model_name}")
+        tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, trust_remote_code=True, token=hf_token)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
 
-    ref_policy = AutoModelForCausalLM.from_pretrained(cfg.model_name, trust_remote_code=True)
-    ref_policy.to(device)
-    ref_policy.eval()
-    for p in ref_policy.parameters():
-        p.requires_grad_(False)
+        # ── 3. Load trainable policy with LoRA (bfloat16) ───────────────────
+        # LoRA on policy only: reduces optimizer state from ~24 GB to ~100 MB.
+        from peft import LoraConfig, get_peft_model, TaskType, PeftModel
+        policy_base = AutoModelForCausalLM.from_pretrained(
+            cfg.model_name,
+            dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+            token=hf_token,
+        )
+        # If the SFT model was saved with a LoRA adapter, we must load+merge it before
+        # applying GRPO LoRA. AutoModelForCausalLM.from_pretrained may not return a
+        # PeftModel subclass even when adapter_config.json is present — so we try
+        # PeftModel.from_pretrained explicitly, then fall back gracefully.
+        try:
+            adapter_policy = PeftModel.from_pretrained(policy_base, cfg.model_name, is_trainable=False)
+            policy_base = adapter_policy.merge_and_unload()
+            print("SFT LoRA adapter merged into base weights for GRPO policy.")
+        except Exception as e:
+            print(f"No PEFT adapter to merge (or already merged): {e}. Using model as-is.")
+        # Also strip any leftover peft_config attributes so get_peft_model won't warn.
+        for _obj in (policy_base, policy_base.config):
+            if hasattr(_obj, "peft_config"):
+                try:
+                    delattr(_obj, "peft_config")
+                except Exception:
+                    pass
+        policy_base.config.use_cache = False
+        lora_config = LoraConfig(
+            r=cfg.lora_r,
+            lora_alpha=cfg.lora_alpha,
+            target_modules="all-linear",  # Qwen3.5-2B DeltaNet requires all-linear
+            lora_dropout=cfg.lora_dropout,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+        )
+        policy = get_peft_model(policy_base, lora_config)
+        policy.enable_input_require_grads()
+        policy.gradient_checkpointing_enable()
+        policy.train()
+        policy.print_trainable_parameters()
+        print("Policy loaded with LoRA adapter.")
 
-    ds = _get_dataset(cfg)
-    if max_examples is not None:
-        ds = ds.select(range(min(max_examples, len(ds))))
-    print(f"Loaded {len(ds)} training examples after filtering.")
+        # ── 4. Load frozen reference policy (SFT checkpoint, for KL regularization) ──
+        print(f"Loading frozen reference model: {cfg.model_name}")
+        ref_policy = AutoModelForCausalLM.from_pretrained(
+            cfg.model_name,
+            dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+            token=hf_token,
+        )
+        ref_policy.eval()
+        for p in ref_policy.parameters():
+            p.requires_grad_(False)
+        print("Reference model loaded (frozen).")
 
-    dl = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True)
+        # ── 5. Load dataset ──────────────────────────────────────────────────
+        ds = _get_dataset(cfg)
+        if max_examples is not None:
+            ds = ds.select(range(min(max_examples, len(ds))))
+        print(f"Loaded {len(ds)} training examples after filtering.")
 
-    optimizer = torch.optim.AdamW(policy.parameters(), lr=cfg.lr)
-    lr_scheduler = get_scheduler(
-        "cosine",
-        optimizer=optimizer,
-        num_warmup_steps=cfg.warmup_steps,
-        num_training_steps=(max_steps if max_steps is not None else cfg.num_training_steps),
-    )
+        dl = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True)
 
-    global_step = 0
-    target_steps = max_steps if max_steps is not None else cfg.num_training_steps
+        # Only LoRA parameters need optimizer — saves ~24 GB vs full AdamW
+        optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, policy.parameters()), lr=cfg.lr
+        )
+        target_steps = max_steps if max_steps is not None else cfg.num_training_steps
+        lr_scheduler = get_scheduler(
+            "cosine",
+            optimizer=optimizer,
+            num_warmup_steps=cfg.warmup_steps,
+            num_training_steps=target_steps,
+        )
 
-    pbar = tqdm(total=target_steps, desc="GRPO", unit="step")
-    while global_step < target_steps:
-        for batch in dl:
-            if global_step >= target_steps:
-                break
+        global_step = 0
 
-            questions = batch["prompt"] if isinstance(batch["prompt"], list) else batch["prompt"].tolist()
-            prompt_types = (
-                batch["prompt_condition"]
-                if isinstance(batch["prompt_condition"], list)
-                else batch["prompt_condition"].tolist()
-            )
-            gold_answers = _safe_list(batch.get("response"), len(questions), default_value="")
-            stated_beliefs = _safe_list(batch.get("stated_belief"), len(questions), default_value="")
+        while global_step < target_steps:
+            for batch in dl:
+                if global_step >= target_steps:
+                    break
 
-            all_logprobs: List[torch.Tensor] = []
-            all_ref_logprobs: List[torch.Tensor] = []
-            all_rewards: List[float] = []
-            reward_records: List[Dict[str, Any]] = []
-            entropies_this_batch: List[float] = []
+                questions = batch["prompt"] if isinstance(batch["prompt"], list) else batch["prompt"].tolist()
+                prompt_types = (
+                    batch["prompt_condition"]
+                    if isinstance(batch["prompt_condition"], list)
+                    else batch["prompt_condition"].tolist()
+                )
+                gold_answers = _safe_list(batch.get("response"), len(questions), default_value="")
+                stated_beliefs = _safe_list(batch.get("stated_belief"), len(questions), default_value="")
 
-            for i in range(len(questions)):
-                q = questions[i]
-                ptype = prompt_types[i]
-                gold = gold_answers[i]
-                stated = stated_beliefs[i]
+                all_logprobs: List[torch.Tensor] = []
+                all_rewards: List[float] = []
+                reward_records: List[Dict[str, Any]] = []
+                entropies_this_batch: List[float] = []
 
-                if ptype not in VALID_CONDITIONS:
+                for i in range(len(questions)):
+                    q = questions[i]
+                    ptype = prompt_types[i]
+                    gold = gold_answers[i]
+                    stated = stated_beliefs[i]
+
+                    if ptype not in VALID_CONDITIONS:
+                        continue
+
+                    messages = [{"role": "user", "content": q}]
+                    prompt_text = tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=False,
+                    )
+                    prompt_enc = tokenizer(
+                        prompt_text,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=cfg.max_length,
+                    )
+                    prompt_ids = prompt_enc["input_ids"].squeeze(0).to(device)
+
+                    with torch.no_grad():
+                        gen_out = policy.generate(
+                            prompt_ids.unsqueeze(0).expand(cfg.num_samples_per_prompt, -1),
+                            max_new_tokens=cfg.max_new_tokens,
+                            do_sample=True,
+                            top_p=0.95,
+                            temperature=1.2,  # higher temp → more diverse samples → non-zero advantages
+                            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+                        )
+
+                    response_ids_list = [
+                        gen_out[j, prompt_ids.shape[0]:]
+                        for j in range(cfg.num_samples_per_prompt)
+                    ]
+
+                    group_rewards: List[float] = []
+                    group_lps: List[torch.Tensor] = []
+
+                    for k in range(cfg.num_samples_per_prompt):
+                        resp_ids = response_ids_list[k]
+                        response_text = tokenizer.decode(resp_ids, skip_special_tokens=True).strip()
+
+                        # score_sampled_response raises on API errors (no silent fallback)
+                        scores = score_sampled_response(
+                            prompt=q,
+                            response=response_text,
+                            prompt_condition=ptype,
+                            gold_answer=gold,
+                            stated_belief=stated,
+                        )
+
+                        factual_score = scores.get("factual_score", 0.0)
+                        endorse_flag = _to_int01(scores.get("endorse_flag", 0), default=0)
+                        overcorr_flag = _to_int01(scores.get("overcorr_flag", 0), default=0)
+
+                        r_dict = compute_reward(
+                            prompt_type=ptype,
+                            factual_score=factual_score,
+                            endorse_flag=endorse_flag,
+                            overcorr_flag=overcorr_flag,
+                            config=reward_cfg,
+                        )
+
+                        reward_value = _to_float(r_dict.get("reward", 0.0), default=0.0)
+                        factual_score_norm = r_dict.get("factual_score_norm", r_dict.get("r_factual", None))
+                        if factual_score_norm is None:
+                            fs = _to_float(factual_score, default=0.0)
+                            factual_score_norm = (fs - 1.0) / 3.0 if 1.0 <= fs <= 4.0 else fs
+                        factual_score_norm = max(0.0, min(1.0, _to_float(factual_score_norm, 0.0)))
+
+                        if debug_print_samples and global_step < 2:
+                            print("\n" + "=" * 80)
+                            print(f"PROMPT TYPE: {ptype}")
+                            print(f"PROMPT: {q}")
+                            print(f"SAMPLE {k}: {response_text}")
+                            print(f"SCORES: {scores}")
+                            print(f"REWARD_DICT: {r_dict}")
+
+                        group_rewards.append(reward_value)
+
+                        reward_records.append(
+                            {
+                                "prompt_type": ptype,
+                                "reward": reward_value,
+                                "factual_score_norm": factual_score_norm,
+                                "endorse_flag": endorse_flag,
+                                "overcorr_flag": overcorr_flag,
+                            }
+                        )
+
+                        lp = _sequence_logprobs(policy, tokenizer, prompt_ids, resp_ids, device)
+                        group_lps.append(lp)
+
+                    all_logprobs.extend(group_lps)
+                    all_rewards.extend(group_rewards)
+
+                    with torch.no_grad():
+                        full = torch.cat([prompt_ids, response_ids_list[0]], dim=0).unsqueeze(0)
+                        out = policy(input_ids=full)
+                        log_p = torch.log_softmax(out.logits[:, :-1], dim=-1)
+                        probs = torch.exp(log_p)
+                        ent = -(probs * log_p).sum(dim=-1).mean().item()
+                        entropies_this_batch.append(ent)
+
+                if not all_rewards:
+                    print("Warning: no valid rewards in batch; skipping step.")
                     continue
 
-                messages = [{"role": "user", "content": q}]
-                prompt_text = tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    enable_thinking=False,
+                logprobs = torch.stack(all_logprobs)
+                rewards_tensor = torch.tensor(all_rewards, dtype=torch.float32, device=device)
+
+                rewards_reshaped = rewards_tensor.view(-1, cfg.num_samples_per_prompt)
+                group_mean = rewards_reshaped.mean(dim=1, keepdim=True)
+                group_std = rewards_reshaped.std(dim=1, keepdim=True, unbiased=False)
+                advantages = ((rewards_reshaped - group_mean) / (group_std + 1e-8)).view(-1)
+
+                loss = -(logprobs * advantages.detach()).mean()
+
+                mean_entropy = sum(entropies_this_batch) / max(len(entropies_this_batch), 1)
+                mean_reward = rewards_tensor.mean().item()
+                cond_stats = _aggregate_condition_stats(reward_records)
+
+                print(
+                    f"[step {global_step + 1}] "
+                    f"loss={loss.item():.4f} "
+                    f"mean_reward={mean_reward:.4f} "
+                    f"entropy={mean_entropy:.4f}"
                 )
-                prompt_enc = tokenizer(
-                    prompt_text,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=cfg.max_length,
+                for cond in ["neutral", "misconception", "correct_belief"]:
+                    if cond in cond_stats:
+                        s = cond_stats[cond]
+                        print(
+                            f"  [{cond}] "
+                            f"n={int(s['count'])} "
+                            f"mean_reward={s['mean_reward']:.4f} "
+                            f"mean_factual={s['mean_factual']:.4f} "
+                            f"endorse_rate={s['mean_endorse']:.4f} "
+                            f"overcorr_rate={s['mean_overcorr']:.4f}"
+                        )
+
+                log_dict = {
+                    "loss": loss.item(),
+                    "mean_reward": mean_reward,
+                    "entropy": mean_entropy,
+                    "lr": lr_scheduler.get_last_lr()[0],
+                }
+                for cond in ["neutral", "misconception", "correct_belief"]:
+                    if cond in cond_stats:
+                        s = cond_stats[cond]
+                        log_dict[f"{cond}/mean_reward"] = s["mean_reward"]
+                        log_dict[f"{cond}/mean_factual"] = s["mean_factual"]
+                        log_dict[f"{cond}/endorse_rate"] = s["mean_endorse"]
+                        log_dict[f"{cond}/overcorr_rate"] = s["mean_overcorr"]
+                wandb.log(log_dict, step=global_step + 1)
+
+                if dry_run:
+                    print("Dry run complete; skipping backward/update.")
+                    return {"dry_run": True}
+
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+                optimizer.step()
+                lr_scheduler.step()
+                global_step += 1
+
+                # ── Intermediate checkpoint ──────────────────────────────────
+                if global_step % CHECKPOINT_EVERY_N_STEPS == 0:
+                    push_to_hf = (global_step % HF_PUSH_EVERY_N_STEPS == 0)
+                    _save_checkpoint(
+                        policy, tokenizer, output_dir, global_step,
+                        hf_repo_id=hf_repo_id if push_to_hf else None,
+                        hf_token=hf_token,
+                    )
+
+        # ── Final save: merge LoRA into weights and push full model ──────────
+        print("Merging LoRA adapter into base weights...")
+        merged_policy = policy.merge_and_unload()
+        merged_policy.save_pretrained(output_dir)
+        tokenizer.save_pretrained(output_dir)
+        print(f"Final merged model saved to {output_dir}")
+
+        metrics = {"output_dir": output_dir, "global_step": global_step}
+
+        if hf_repo_id and hf_token:
+            try:
+                from huggingface_hub import HfApi, login
+                login(token=hf_token)
+                api = HfApi()
+                api.create_repo(repo_id=hf_repo_id, exist_ok=True)
+                api.upload_folder(
+                    folder_path=output_dir,
+                    repo_id=hf_repo_id,
+                    repo_type="model",
+                    path_in_repo=".",
                 )
-                prompt_ids = prompt_enc["input_ids"].squeeze(0).to(device)
+                print(f"Pushed final model to https://huggingface.co/{hf_repo_id}")
+                metrics["hf_repo_id"] = hf_repo_id
+            except Exception as e:
+                raise RuntimeError(f"HF Hub push failed: {e}") from e
 
-                with torch.no_grad():
-                    gen_out = policy.generate(
-                        prompt_ids.unsqueeze(0).expand(cfg.num_samples_per_prompt, -1),
-                        max_new_tokens=cfg.max_new_tokens,
-                        do_sample=True,
-                        top_p=0.95,
-                        temperature=1.0,
-                        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-                    )
+        return metrics
 
-                response_ids_list = [
-                    gen_out[j, prompt_ids.shape[0]:]
-                    for j in range(cfg.num_samples_per_prompt)
-                ]
-
-                group_rewards: List[float] = []
-                group_lps: List[torch.Tensor] = []
-                group_ref_lps: List[torch.Tensor] = []
-
-                for k in range(cfg.num_samples_per_prompt):
-                    resp_ids = response_ids_list[k]
-                    response_text = tokenizer.decode(resp_ids, skip_special_tokens=True).strip()
-
-                    scores = score_sampled_response(
-                        prompt=q,
-                        response=response_text,
-                        prompt_condition=ptype,
-                        gold_answer=gold,
-                        stated_belief=stated,
-                    )
-
-                    factual_score = scores.get("factual_score", 0.0)
-                    endorse_flag = _to_int01(scores.get("endorse_flag", 0), default=0)
-                    overcorr_flag = _to_int01(scores.get("overcorr_flag", 0), default=0)
-
-                    r_dict = compute_reward(
-                        prompt_type=ptype,
-                        factual_score=factual_score,
-                        endorse_flag=endorse_flag,
-                        overcorr_flag=overcorr_flag,
-                        config=reward_cfg,
-                    )
-
-                    reward_value = _to_float(r_dict.get("reward", 0.0), default=0.0)
-                    factual_score_norm = r_dict.get("factual_score_norm", r_dict.get("r_factual", None))
-                    if factual_score_norm is None:
-                        fs = _to_float(factual_score, default=0.0)
-                        factual_score_norm = (fs - 1.0) / 3.0 if 1.0 <= fs <= 4.0 else fs
-                    factual_score_norm = max(0.0, min(1.0, _to_float(factual_score_norm, 0.0)))
-
-                    group_rewards.append(reward_value)
-
-                    reward_records.append(
-                        {
-                            "prompt_type": ptype,
-                            "reward": reward_value,
-                            "factual_score_norm": factual_score_norm,
-                            "endorse_flag": endorse_flag,
-                            "overcorr_flag": overcorr_flag,
-                        }
-                    )
-
-                    lp = _sequence_logprobs(policy, tokenizer, prompt_ids, resp_ids, device)
-                    with torch.no_grad():
-                        ref_lp = _sequence_logprobs(ref_policy, tokenizer, prompt_ids, resp_ids, device)
-
-                    group_lps.append(lp)
-                    group_ref_lps.append(ref_lp)
-
-                all_logprobs.extend(group_lps)
-                all_ref_logprobs.extend(group_ref_lps)
-                all_rewards.extend(group_rewards)
-
-                with torch.no_grad():
-                    full = torch.cat([prompt_ids, response_ids_list[0]], dim=0).unsqueeze(0)
-                    out = policy(input_ids=full)
-                    log_p = torch.log_softmax(out.logits[:, :-1], dim=-1)
-                    probs = torch.exp(log_p)
-                    ent = -(probs * log_p).sum(dim=-1).mean().item()
-                    entropies_this_batch.append(ent)
-
-            if not all_rewards:
-                print("Warning: no valid rewards in batch; skipping step.")
-                continue
-
-            logprobs = torch.stack(all_logprobs)
-            ref_logprobs = torch.stack(all_ref_logprobs)
-            rewards_tensor = torch.tensor(all_rewards, dtype=torch.float32, device=device)
-
-            rewards_reshaped = rewards_tensor.view(-1, cfg.num_samples_per_prompt)
-            group_mean = rewards_reshaped.mean(dim=1, keepdim=True)
-            group_std = rewards_reshaped.std(dim=1, keepdim=True, unbiased=False)
-            advantages = ((rewards_reshaped - group_mean) / (group_std + 1e-8)).view(-1)
-
-            policy_loss = -(logprobs * advantages.detach()).mean()
-            kl_proxy = (logprobs - ref_logprobs.detach()).mean()
-            loss = policy_loss + cfg.kl_coeff * kl_proxy
-
-            mean_entropy = sum(entropies_this_batch) / max(len(entropies_this_batch), 1)
-            mean_reward = rewards_tensor.mean().item()
-            cond_stats = _aggregate_condition_stats(reward_records)
-
-            pbar.set_postfix(
-                loss=f"{loss.item():.3f}",
-                reward=f"{mean_reward:.3f}",
-                kl=f"{kl_proxy.item():.3f}",
-                ent=f"{mean_entropy:.3f}",
-            )
-
-            # Log to wandb
-            log_dict = {
-                "loss": loss.item(),
-                "policy_loss": policy_loss.item(),
-                "kl_proxy": kl_proxy.item(),
-                "mean_reward": mean_reward,
-                "entropy": mean_entropy,
-                "lr": lr_scheduler.get_last_lr()[0],
-            }
-            for cond in ["neutral", "misconception", "correct_belief"]:
-                if cond in cond_stats:
-                    s = cond_stats[cond]
-                    log_dict[f"{cond}/mean_reward"] = s["mean_reward"]
-                    log_dict[f"{cond}/mean_factual"] = s["mean_factual"]
-                    log_dict[f"{cond}/endorse_rate"] = s["mean_endorse"]
-                    log_dict[f"{cond}/overcorr_rate"] = s["mean_overcorr"]
-            wandb.log(log_dict, step=global_step + 1)
-
-            if dry_run:
-                pbar.close()
-                print("Dry run complete; skipping backward/update.")
-                wandb.finish()
-                return {"dry_run": True}
-
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
-            optimizer.step()
-            lr_scheduler.step()
-            global_step += 1
-            pbar.update(1)
-
-    pbar.close()
-    policy.save_pretrained(output_dir)
-    tokenizer.save_pretrained(output_dir)
-    print(f"Saved to {output_dir}")
-
-    wandb.finish()
-
-    metrics = {"output_dir": output_dir, "global_step": global_step}
-    hf_token = os.environ.get("HF_TOKEN")
-    if hf_repo_id and hf_token:
-        try:
-            from huggingface_hub import HfApi, login
-            login(token=hf_token)
-            api = HfApi()
-            api.create_repo(repo_id=hf_repo_id, exist_ok=True)
-            api.upload_folder(
-                folder_path=output_dir,
-                repo_id=hf_repo_id,
-                repo_type="model",
-                path_in_repo=".",
-            )
-            print(f"Pushed to https://huggingface.co/{hf_repo_id}")
-            metrics["hf_repo_id"] = hf_repo_id
-        except Exception as e:
-            raise RuntimeError(f"HF Hub push failed: {e}") from e
-    return metrics
+    finally:
+        # Always finish wandb run — even on exception or timeout
+        wandb.finish()
 
 
 def run_grpo_training() -> None:
     parser = argparse.ArgumentParser(description="GRPO-style trainer.")
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-1.7B")
+    parser.add_argument("--model_name", type=str, default="technojules/qwen3.5-2b-sft-medquad")
     parser.add_argument("--hf_dataset", type=str, default="mli5/medquad-sycophancy")
     parser.add_argument("--output_dir", type=str, default="grpo_qwen_ckpt")
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--num_samples_per_prompt", type=int, default=4)
     parser.add_argument("--num_training_steps", type=int, default=1000)
     parser.add_argument("--lr", type=float, default=1e-6)
-    parser.add_argument("--kl_coeff", type=float, default=0.01)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--reward_mode", type=str, default="condition_aware",
                         choices=["factual_only", "condition_aware"])
@@ -495,7 +612,6 @@ def run_grpo_training() -> None:
         num_samples_per_prompt=args.num_samples_per_prompt,
         num_training_steps=args.num_training_steps,
         lr=args.lr,
-        kl_coeff=args.kl_coeff,
         device=args.device,
     )
     reward_cfg = RewardConfig(

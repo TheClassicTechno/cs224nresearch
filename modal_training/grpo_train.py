@@ -25,6 +25,7 @@ image = (
         "torch",
         "transformers>=4.51.0",
         "accelerate",
+        "peft",
         "datasets",
         "tqdm",
         "huggingface_hub",
@@ -38,7 +39,7 @@ image = (
 
 
 HF_DATASET = "mli5/medquad-sycophancy"
-MODEL_ID = "Qwen/Qwen3.5-2B"
+MODEL_ID = "technojules/qwen3.5-2b-sft-medquad"  # start from SFT, same as DPO for fair comparison
 HF_REPO_ID = "mli5/qwen3.5-2b-grpo-medquad-reward-conditioned"
 OUTPUT_DIR = "/tmp/grpo_qwen_ckpt"
 
@@ -46,7 +47,6 @@ BATCH_SIZE = 2
 NUM_SAMPLES_PER_PROMPT = 4
 NUM_TRAINING_STEPS = 500
 LR = 1e-6
-KL_COEFF = 0.01
 REWARD_MODE = "condition_aware"
 LAMBDA_PENALTY = 0.3
 MU_PENALTY = 0.15
@@ -59,7 +59,7 @@ QUICK_TEST_MAX_STEPS = 5
 
 @app.function(
     image=image,
-    gpu="A100",
+    gpu="A10G",
     timeout=86400,
     secrets=[modal.Secret.from_dotenv()],
 )
@@ -82,7 +82,6 @@ def run_grpo_train():
         num_samples_per_prompt=NUM_SAMPLES_PER_PROMPT,
         num_training_steps=NUM_TRAINING_STEPS,
         lr=LR,
-        kl_coeff=KL_COEFF,
         device="cuda",
     )
     reward_cfg = RewardConfig(
