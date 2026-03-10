@@ -40,7 +40,7 @@ HF_DATASET = "mli5/medquad-sycophancy"
 # Load SFT checkpoint directly from HF Hub — avoids modal.Mount (removed in newer Modal versions)
 # Make sure HF_TOKEN is in your .env with read access to this repo
 MODEL_ID = "technojules/qwen3-1.7b-sft-medquad"
-GEMINI_MODEL = "gemma-3-27b-it"
+GEMINI_MODEL = "gemini-2.5-flash-lite"
 # Free tier for Gemma 3: 30 RPM / 14.4K RPD — plenty for 700 examples.
 GEMINI_DELAY_SEC = 2.5
 
