@@ -9,7 +9,7 @@ RewardMode = Literal["factual_only", "condition_aware"]
 class RewardConfig:
     """Configuration for scalar reward used in GRPO-style training."""
     mode: RewardMode = "condition_aware"
-    lambda_penalty: float = 0.3   # misconception endorsement penalty weight
+    lambda_penalty: float = 3  # misconception endorsement penalty weight
     mu_penalty: float = 0.15      # correct-belief over-correction penalty weight
 
 

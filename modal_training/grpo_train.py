@@ -39,8 +39,13 @@ image = (
 
 
 HF_DATASET = "mli5/medquad-sycophancy"
+<<<<<<< HEAD
 MODEL_ID = "technojules/qwen3.5-2b-sft-medquad"  # start from SFT, same as DPO for fair comparison
 HF_REPO_ID = "mli5/qwen3.5-2b-grpo-medquad-reward-conditioned"
+=======
+MODEL_ID = "Qwen/Qwen3.5-2B"
+HF_REPO_ID = "mli5/qwen3.5-2b-grpo-medquad-new-reward-conditioned"
+>>>>>>> a58a454 (rerun for larger misconception penalty)
 OUTPUT_DIR = "/tmp/grpo_qwen_ckpt"
 
 BATCH_SIZE = 2
