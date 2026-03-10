@@ -1,5 +1,5 @@
 """
-SFT evaluation: Qwen3-1.7B-SFT on the eval split of syc_dataset.jsonl.
+SFT evaluation on the eval split of medquad-sycophancy.
 
 Metrics:
   - accuracy_neutral: factual accuracy on neutral prompts
@@ -43,7 +43,7 @@ image = (
 HF_DATASET = "mli5/medquad-sycophancy"
 # Load SFT checkpoint directly from HF Hub — avoids modal.Mount (removed in newer Modal versions)
 # Make sure HF_TOKEN is in your .env with read access to this repo
-MODEL_ID = "jillianchang/qwen2-7b-sft-medquad"
+DEFAULT_MODEL_ID = "mli5/qwen3.5-4b-sft-medquad"
 GEMINI_MODEL = "gemini-2.5-flash-lite"
 # Free tier for Gemini 2.5 Flash Lite
 GEMINI_DELAY_SEC = 2.5
@@ -51,9 +51,6 @@ GEMINI_DELAY_SEC = 2.5
 # Persist to volume so runs can resume after disconnect (use modal run --detach).
 eval_volume = modal.Volume.from_name("sft-eval-cache", create_if_missing=True)
 VOLUME_PATH = "/eval_volume"
-RESPONSES_CACHE = f"{VOLUME_PATH}/sft_responses.json"
-JUDGMENTS_CACHE = f"{VOLUME_PATH}/sft_judgments.json"
-
 JUDGE_PROMPT = """You are a factual accuracy judge for medical questions.
 
 Question: {question}
@@ -119,13 +116,22 @@ def call_judge(client, question: str, response: str, gold_answer: str) -> int:
     volumes={VOLUME_PATH: eval_volume},
     secrets=[modal.Secret.from_dotenv()],
 )
-def run_sft_eval():
+def run_sft_eval(model_id: str = DEFAULT_MODEL_ID):
     import json
     import torch
     from datasets import load_dataset
     from transformers import AutoTokenizer
     from tqdm import tqdm
     from google import genai
+
+    cache_tag = (
+        model_id.replace("/", "__")
+        .replace(":", "_")
+        .replace(".", "_")
+        .replace("-", "_")
+    )
+    responses_cache = f"{VOLUME_PATH}/sft_responses_{cache_tag}.json"
+    judgments_cache = f"{VOLUME_PATH}/sft_judgments_{cache_tag}.json"
 
     # Require Gemini API key up front (used for judge); fail fast instead of after inference.
     if not os.environ.get("GEMINI_API_KEY"):
@@ -142,18 +148,18 @@ def run_sft_eval():
     print(f"Loaded {len(examples)} eval examples from {HF_DATASET} (all prompt_condition types).")
 
     # ── 2. Inference (skip if cached) ───────────────────────────────────────
-    if os.path.exists(RESPONSES_CACHE):
-        print(f"Loading cached inference responses from {RESPONSES_CACHE}")
-        with open(RESPONSES_CACHE) as f:
+    if os.path.exists(responses_cache):
+        print(f"Loading cached inference responses from {responses_cache}")
+        with open(responses_cache) as f:
             responses = json.load(f)
         print(f"Loaded {len(responses)} cached responses.")
     else:
         from transformers import AutoModelForCausalLM
-        print(f"Loading tokenizer and model from checkpoint: {MODEL_ID}")
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True, token=hf_token)
+        print(f"Loading tokenizer and model from checkpoint: {model_id}")
+        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, token=hf_token)
         tokenizer.padding_side = "left"  # required for correct token stripping in batch inference
         model = AutoModelForCausalLM.from_pretrained(
-            MODEL_ID,
+            model_id,
             dtype=torch.bfloat16,
             device_map="auto",
             trust_remote_code=True,
@@ -204,10 +210,10 @@ def run_sft_eval():
                 responses.append(text)
 
         print(f"Inference complete. Generated {len(responses)} responses.")
-        with open(RESPONSES_CACHE, "w") as f:
+        with open(responses_cache, "w") as f:
             json.dump(responses, f)
         eval_volume.commit()
-        print(f"Responses cached to {RESPONSES_CACHE}")
+        print(f"Responses cached to {responses_cache}")
 
     # ── 3. Judge with Gemini (resumable from volume) ────────────────────────
     api_key = os.environ["GEMINI_API_KEY"]
@@ -215,8 +221,8 @@ def run_sft_eval():
 
     n = len(examples)
     judgments = [ -1 ] * n
-    if os.path.exists(JUDGMENTS_CACHE):
-        with open(JUDGMENTS_CACHE) as f:
+    if os.path.exists(judgments_cache):
+        with open(judgments_cache) as f:
             loaded = json.load(f)
         if len(loaded) == n and all(x in (-1, 0, 1) for x in loaded):
             judgments = loaded
@@ -235,13 +241,13 @@ def run_sft_eval():
         judgments[i] = score
         time.sleep(GEMINI_DELAY_SEC)
         if (i + 1) % SAVE_EVERY == 0:
-            with open(JUDGMENTS_CACHE, "w") as f:
+            with open(judgments_cache, "w") as f:
                 json.dump(judgments, f)
             eval_volume.commit()
             print(f"  Checkpoint: {sum(1 for x in judgments if x >= 0)}/{n} judged")
 
     # Final checkpoint
-    with open(JUDGMENTS_CACHE, "w") as f:
+    with open(judgments_cache, "w") as f:
         json.dump(judgments, f)
     eval_volume.commit()
 
@@ -311,11 +317,11 @@ def run_sft_eval():
         api.upload_file(
             path_or_fileobj="/tmp/sft_eval_results.json",
             path_in_repo=path_in_repo,
-            repo_id=MODEL_ID,
+            repo_id=model_id,
             repo_type="model",
             token=hf_token,
         )
-        print(f"Eval results uploaded to {MODEL_ID} -> {path_in_repo}")
+        print(f"Eval results uploaded to {model_id} -> {path_in_repo}")
     except Exception as e:
         print(f"[Warning] Could not upload eval results to HF: {e}")
 
@@ -323,6 +329,6 @@ def run_sft_eval():
 
 
 @app.local_entrypoint()
-def main():
-    result = run_sft_eval.remote()
+def main(model_id: str = ""):
+    result = run_sft_eval.remote(model_id=model_id or DEFAULT_MODEL_ID)
     print(result)

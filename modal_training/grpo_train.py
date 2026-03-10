@@ -11,11 +11,11 @@ Quick test (few examples, no HF push): set QUICK_TEST = True below.
 """
 
 import os
+
 import modal
 
 app = modal.App("qwen-grpo-train")
 
-# Bake repo into image 
 _here = os.path.dirname(os.path.abspath(__file__))
 _repo_root = os.path.abspath(os.path.join(_here, ".."))
 
@@ -39,13 +39,8 @@ image = (
 
 
 HF_DATASET = "mli5/medquad-sycophancy"
-<<<<<<< HEAD
 MODEL_ID = "technojules/qwen3.5-2b-sft-medquad"  # start from SFT, same as DPO for fair comparison
-HF_REPO_ID = "mli5/qwen3.5-2b-grpo-medquad-reward-conditioned"
-=======
-MODEL_ID = "Qwen/Qwen3.5-2B"
 HF_REPO_ID = "mli5/qwen3.5-2b-grpo-medquad-new-reward-conditioned"
->>>>>>> a58a454 (rerun for larger misconception penalty)
 OUTPUT_DIR = "/tmp/grpo_qwen_ckpt"
 
 BATCH_SIZE = 2
@@ -54,7 +49,7 @@ NUM_TRAINING_STEPS = 250
 WARMUP_STEPS = 25
 LR = 1e-6
 REWARD_MODE = "condition_aware"
-LAMBDA_PENALTY = 0.3
+LAMBDA_PENALTY = 3
 MU_PENALTY = 0.15
 MAX_EXAMPLES = 250
 SAMPLE_RANDOMLY = True
@@ -74,9 +69,10 @@ QUICK_TEST_MAX_STEPS = 5
 )
 def run_grpo_train():
     import sys
+
     sys.path.insert(0, "/root/repo")
 
-    from training.grpo_train import run_grpo, GRPOConfig
+    from training.grpo_train import GRPOConfig, run_grpo
     from training.reward import RewardConfig
 
     hf_token = os.environ.get("HF_TOKEN")
@@ -110,7 +106,10 @@ def run_grpo_train():
         max_steps = None
         hf_repo_id = HF_REPO_ID if hf_token else None
 
-    print(f"Running GRPO: model={MODEL_ID}, dataset={HF_DATASET}, steps={cfg.num_training_steps if max_steps is None else max_steps}")
+    print(
+        f"Running GRPO: model={MODEL_ID}, dataset={HF_DATASET}, "
+        f"steps={cfg.num_training_steps if max_steps is None else max_steps}"
+    )
     metrics = run_grpo(
         cfg,
         reward_cfg,

@@ -35,7 +35,7 @@ image = (
 
 HF_DATASET = "mli5/medquad-sycophancy"
 
-MODEL_ID = "Qwen/Qwen3.5-2B"
+MODEL_ID = "Qwen/Qwen3.5-4B"
 GEMINI_MODEL = "gemini-2.5-flash-lite"
 GEMINI_DELAY_SEC = 0.3
 
