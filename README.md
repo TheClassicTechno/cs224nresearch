@@ -1,5 +1,8 @@
 # cs224nresearch
 Juli Huang, Michael Li, Jillian Chang
+
+Reward Design for Medical Safety: Reducing
+Sycophancy via Truth-Weighted RLHF
 ## Setup
 
 1. Create the conda environment (first time only):
@@ -57,25 +60,3 @@ python evaluation/eval.py \
   --subset_size 10
 ```
 
-## Project Structure
-
-cs224nresearch/
-├── dataset/
-│   ├── create_syc_dataset.py   # sycophancy conversion
-│   └── dataset_utils.py        # shared loading/preprocessing
-├── reward/
-│   ├── judge.py                # LLM-as-judge scoring (R_factual, R_syc, R_contra)
-│   ├── reward_fn.py            # Reward function with truth-weighted configs
-│   ├── metrics.py              # Evaluation metrics computation
-│   ├── evaluate.py             # Full evaluation pipeline
-│   └── baseline_eval.py        # Baseline evaluation wrapper
-├── training/
-│   ├── grpo_train.py           # GRPO training loop
-│   ├── ppo_train.py            # PPO training loop
-│   └── reward.py               # reward model / reward functions
-├── evaluation/
-│   └── eval.py                 # Baseline eval: inference + scoring
-├── configs/
-│   ├── grpo_config.yaml
-│   └── ppo_config.yaml
-└── requirements.txt
