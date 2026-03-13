@@ -1,20 +1,19 @@
 """
-GRPO training on Modal
-Run GRPO on a Modal GPU, save to /tmp, then optionally push to HF Hub.
-Uses training package baked into the image via add_local_dir.
+GRPO + LoRA training on Modal.
+
+This entrypoint runs the no-KL LoRA-only GRPO trainer on an A10G GPU and saves
+the adapter checkpoint to /tmp before optionally pushing it to the HF Hub.
 
 Run:
-    modal run modal_training/grpo_train.py
-    modal run --detach modal_training/grpo_train.py
-
-Quick test (few examples, no HF push): set QUICK_TEST = True below.
+    modal run modal_training/grpo_lora_train.py
+    modal run --detach modal_training/grpo_lora_train.py
 """
 
 import os
 
 import modal
 
-app = modal.App("qwen-grpo-train")
+app = modal.App("qwen-grpo-lora-train")
 
 _here = os.path.dirname(os.path.abspath(__file__))
 _repo_root = os.path.abspath(os.path.join(_here, ".."))
@@ -25,13 +24,13 @@ image = (
         "torch",
         "transformers>=4.51.0",
         "accelerate",
-        "peft",
         "datasets",
         "tqdm",
         "huggingface_hub",
         "openai",
         "pydantic",
         "wandb",
+        "peft",
     )
     .env({"PYTHONUNBUFFERED": "1"})
     .add_local_dir(_repo_root, remote_path="/root/repo")
@@ -39,27 +38,33 @@ image = (
 
 
 HF_DATASET = "mli5/medquad-sycophancy"
-MODEL_ID = "technojules/qwen3.5-2b-sft-medquad"  # start from SFT, same as DPO for fair comparison
-HF_REPO_ID = "mli5/qwen3.5-2b-grpo-medquad-new-reward-conditioned"
-OUTPUT_DIR = "/tmp/grpo_qwen_ckpt"
+MODEL_ID = "Qwen/Qwen3.5-2B"
+HF_REPO_ID = "mli5/qwen3.5-2b-grpo-lora-no-kl"
+OUTPUT_DIR = "/tmp/grpo_lora_qwen_ckpt"
 
 BATCH_SIZE = 2
 NUM_SAMPLES_PER_PROMPT = 4
-NUM_TRAINING_STEPS = 250
-WARMUP_STEPS = 25
+MAX_NEW_TOKENS = 1024
+MAX_LENGTH = 1024
+MAX_EXAMPLES = 1800
+NUM_TRAINING_STEPS = 900
+WARMUP_STEPS = 90
 LR = 1e-6
+
+LORA_R = 32
+LORA_ALPHA = 64
+LORA_DROPOUT = 0.05
+LORA_TARGET_MODULES = "all-linear"
+
 REWARD_MODE = "condition_aware"
-LAMBDA_PENALTY = 3
+LAMBDA_PENALTY = 1.5
 MU_PENALTY = 0.15
-MAX_EXAMPLES = 250
-SAMPLE_RANDOMLY = True
+SAMPLE_RANDOMLY = False
 SAMPLE_SEED = 42
 
-# Quick test: few examples, no HF push (flip to True to test)
-QUICK_TEST = True
-QUICK_TEST_MAX_EXAMPLES = 10
-QUICK_TEST_MAX_STEPS = 5
-VERBOSE_SAMPLES = True
+QUICK_TEST = False
+QUICK_TEST_MAX_EXAMPLES = 8
+QUICK_TEST_MAX_STEPS = 2
 
 
 @app.function(
@@ -68,17 +73,17 @@ VERBOSE_SAMPLES = True
     timeout=86400,
     secrets=[modal.Secret.from_dotenv()],
 )
-def run_grpo_train():
+def run_grpo_lora_train():
     import sys
 
     sys.path.insert(0, "/root/repo")
 
-    from training.grpo_train import GRPOConfig, run_grpo
+    from training.grpo_lora_train import GRPOLoRAConfig, run_grpo_lora
     from training.reward import RewardConfig
 
     hf_token = os.environ.get("HF_TOKEN")
 
-    cfg = GRPOConfig(
+    cfg = GRPOLoRAConfig(
         model_name=MODEL_ID,
         data_path=None,
         hf_dataset=HF_DATASET,
@@ -86,10 +91,16 @@ def run_grpo_train():
         rl_subset_split="rl_train",
         batch_size=BATCH_SIZE,
         num_samples_per_prompt=NUM_SAMPLES_PER_PROMPT,
+        max_new_tokens=MAX_NEW_TOKENS,
+        max_length=MAX_LENGTH,
         num_training_steps=NUM_TRAINING_STEPS,
         warmup_steps=WARMUP_STEPS,
         lr=LR,
         device="cuda",
+        lora_r=LORA_R,
+        lora_alpha=LORA_ALPHA,
+        lora_dropout=LORA_DROPOUT,
+        lora_target_modules=LORA_TARGET_MODULES,
     )
     reward_cfg = RewardConfig(
         mode=REWARD_MODE,
@@ -104,14 +115,14 @@ def run_grpo_train():
         print(f"QUICK_TEST: max_examples={max_examples}, max_steps={max_steps}, no HF push")
     else:
         max_examples = MAX_EXAMPLES
-        max_steps = None
+        max_steps = NUM_TRAINING_STEPS
         hf_repo_id = HF_REPO_ID if hf_token else None
 
     print(
-        f"Running GRPO: model={MODEL_ID}, dataset={HF_DATASET}, "
-        f"steps={cfg.num_training_steps if max_steps is None else max_steps}"
+        "Running GRPO+LoRA: "
+        f"model={MODEL_ID}, dataset={HF_DATASET}, max_examples={max_examples}, steps={max_steps}"
     )
-    metrics = run_grpo(
+    metrics = run_grpo_lora(
         cfg,
         reward_cfg,
         output_dir=OUTPUT_DIR,
@@ -120,8 +131,10 @@ def run_grpo_train():
         sample_randomly=SAMPLE_RANDOMLY and not QUICK_TEST,
         sample_seed=SAMPLE_SEED,
         max_steps=max_steps,
-        debug_print_samples=VERBOSE_SAMPLES,
+        debug_print_samples=QUICK_TEST,
         dry_run=False,
+        wandb_project="grpo-sycophancy",
+        wandb_run_name="qwen3.5-2b-grpo-lora-no-kl",
     )
     print(f"Done. Metrics: {metrics}")
     return metrics
@@ -129,5 +142,5 @@ def run_grpo_train():
 
 @app.local_entrypoint()
 def main():
-    metrics = run_grpo_train.remote()
+    metrics = run_grpo_lora_train.remote()
     print(metrics)

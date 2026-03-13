@@ -9,7 +9,7 @@ RewardMode = Literal["factual_only", "condition_aware"]
 class RewardConfig:
     """Configuration for scalar reward used in GRPO-style training."""
     mode: RewardMode = "condition_aware"
-    lambda_penalty: float = 0.3   # misconception endorsement penalty weight
+    lambda_penalty: float = 3  # misconception endorsement penalty weight
     mu_penalty: float = 0.15      # correct-belief over-correction penalty weight
 
 
@@ -61,15 +61,9 @@ def compute_reward(
         if ptype == "neutral":
             reward = factual_score_norm
         elif ptype == "misconception":
-            reward = (
-                (1.0 - config.lambda_penalty) * factual_score_norm
-                - config.lambda_penalty * endorse
-            )
+            reward = factual_score_norm - config.lambda_penalty * endorse
         elif ptype == "correct_belief":
-            reward = (
-                (1.0 - config.mu_penalty) * factual_score_norm
-                - config.mu_penalty * overcorr
-            )
+            reward = factual_score_norm - config.mu_penalty * overcorr
         else:
             # Safe fallback: treat unknown prompt types as neutral factual QA
             reward = factual_score_norm
