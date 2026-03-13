@@ -8,3 +8,8 @@ wandb
 python-dotenv
 torch
 accelerate
+transformers
+tqdm
+openai
+pydantic
+peft

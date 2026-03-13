@@ -1,20 +1,15 @@
 """
-GRPO training on Modal
-Run GRPO on a Modal GPU, save to /tmp, then optionally push to HF Hub.
-Uses training package baked into the image via add_local_dir.
+Online DPO + LoRA training on Modal.
 
-Run:
-    modal run modal_training/grpo_train.py
-    modal run --detach modal_training/grpo_train.py
-
-Quick test (few examples, no HF push): set QUICK_TEST = True below.
+This entrypoint trains against judge-gated gold-vs-sampled preference pairs and
+saves the adapter checkpoint to /tmp before optionally pushing it to the HF Hub.
 """
 
 import os
 
 import modal
 
-app = modal.App("qwen-grpo-train")
+app = modal.App("qwen-online-dpo-train")
 
 _here = os.path.dirname(os.path.abspath(__file__))
 _repo_root = os.path.abspath(os.path.join(_here, ".."))
@@ -25,13 +20,13 @@ image = (
         "torch",
         "transformers>=4.51.0",
         "accelerate",
-        "peft",
         "datasets",
         "tqdm",
         "huggingface_hub",
         "openai",
         "pydantic",
         "wandb",
+        "peft",
     )
     .env({"PYTHONUNBUFFERED": "1"})
     .add_local_dir(_repo_root, remote_path="/root/repo")
@@ -39,62 +34,73 @@ image = (
 
 
 HF_DATASET = "mli5/medquad-sycophancy"
-MODEL_ID = "technojules/qwen3.5-2b-sft-medquad"  # start from SFT, same as DPO for fair comparison
-HF_REPO_ID = "mli5/qwen3.5-2b-grpo-medquad-new-reward-conditioned"
-OUTPUT_DIR = "/tmp/grpo_qwen_ckpt"
+MODEL_ID = "Qwen/Qwen3.5-2B"
+HF_REPO_ID = "mli5/qwen3.5-2b-online-dpo-lora"
+OUTPUT_DIR = "/tmp/online_dpo_qwen_ckpt"
 
 BATCH_SIZE = 2
-NUM_SAMPLES_PER_PROMPT = 4
-NUM_TRAINING_STEPS = 250
-WARMUP_STEPS = 25
+MAX_NEW_TOKENS = 256
+MAX_LENGTH = 1024
+NUM_TRAINING_STEPS = 900
+WARMUP_STEPS = 50
 LR = 1e-6
-REWARD_MODE = "condition_aware"
-LAMBDA_PENALTY = 3
-MU_PENALTY = 0.15
-MAX_EXAMPLES = 250
-SAMPLE_RANDOMLY = True
+BETA = 0.1
+MIN_FACTUAL_SCORE_FOR_SKIP = 3.0
+MAX_EXAMPLES = 1800
+SAMPLE_RANDOMLY = False
 SAMPLE_SEED = 42
 
-# Quick test: few examples, no HF push (flip to True to test)
-QUICK_TEST = True
-QUICK_TEST_MAX_EXAMPLES = 10
-QUICK_TEST_MAX_STEPS = 5
-VERBOSE_SAMPLES = True
+LORA_R = 32
+LORA_ALPHA = 64
+LORA_DROPOUT = 0.05
+LORA_TARGET_MODULES = "all-linear"
+
+JUDGE_MODEL = "gpt-5-nano-2025-08-07"
+WANDB_PROJECT = "online-dpo-sycophancy"
+WANDB_RUN_NAME = "qwen3.5-2b-online-dpo-lora"
+
+QUICK_TEST = False
+QUICK_TEST_MAX_EXAMPLES = 8
+QUICK_TEST_MAX_STEPS = 2
 
 
 @app.function(
     image=image,
-    gpu="A10G",
+    gpu="A100",
     timeout=86400,
     secrets=[modal.Secret.from_dotenv()],
 )
-def run_grpo_train():
+def run_online_dpo_train():
     import sys
 
     sys.path.insert(0, "/root/repo")
 
-    from training.grpo_train import GRPOConfig, run_grpo
-    from training.reward import RewardConfig
+    from training.online_dpo_train import OnlineDPOConfig, run_online_dpo
 
     hf_token = os.environ.get("HF_TOKEN")
+    os.environ["GRPO_JUDGE_MODEL"] = JUDGE_MODEL
 
-    cfg = GRPOConfig(
+    cfg = OnlineDPOConfig(
         model_name=MODEL_ID,
         data_path=None,
         hf_dataset=HF_DATASET,
         split="train",
         rl_subset_split="rl_train",
         batch_size=BATCH_SIZE,
-        num_samples_per_prompt=NUM_SAMPLES_PER_PROMPT,
+        max_new_tokens=MAX_NEW_TOKENS,
+        max_length=MAX_LENGTH,
+        lr=LR,
         num_training_steps=NUM_TRAINING_STEPS,
         warmup_steps=WARMUP_STEPS,
-        lr=LR,
+        beta=BETA,
+        min_factual_score_for_skip=MIN_FACTUAL_SCORE_FOR_SKIP,
+        use_endorse_gate=True,
+        use_overcorr_gate=True,
         device="cuda",
-    )
-    reward_cfg = RewardConfig(
-        mode=REWARD_MODE,
-        lambda_penalty=LAMBDA_PENALTY,
-        mu_penalty=MU_PENALTY,
+        lora_r=LORA_R,
+        lora_alpha=LORA_ALPHA,
+        lora_dropout=LORA_DROPOUT,
+        lora_target_modules=LORA_TARGET_MODULES,
     )
 
     if QUICK_TEST:
@@ -108,20 +114,22 @@ def run_grpo_train():
         hf_repo_id = HF_REPO_ID if hf_token else None
 
     print(
-        f"Running GRPO: model={MODEL_ID}, dataset={HF_DATASET}, "
-        f"steps={cfg.num_training_steps if max_steps is None else max_steps}"
+        "Running Online DPO: "
+        f"model={MODEL_ID}, dataset={HF_DATASET}, max_examples={max_examples}, "
+        f"steps={max_steps if max_steps is not None else NUM_TRAINING_STEPS}"
     )
-    metrics = run_grpo(
+    metrics = run_online_dpo(
         cfg,
-        reward_cfg,
         output_dir=OUTPUT_DIR,
         hf_repo_id=hf_repo_id,
         max_examples=max_examples,
         sample_randomly=SAMPLE_RANDOMLY and not QUICK_TEST,
         sample_seed=SAMPLE_SEED,
         max_steps=max_steps,
-        debug_print_samples=VERBOSE_SAMPLES,
+        debug_print_samples=QUICK_TEST,
         dry_run=False,
+        wandb_project=WANDB_PROJECT,
+        wandb_run_name=WANDB_RUN_NAME,
     )
     print(f"Done. Metrics: {metrics}")
     return metrics
@@ -129,5 +137,5 @@ def run_grpo_train():
 
 @app.local_entrypoint()
 def main():
-    metrics = run_grpo_train.remote()
+    metrics = run_online_dpo_train.remote()
     print(metrics)

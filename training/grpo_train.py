@@ -186,6 +186,7 @@ def _aggregate_condition_stats(records: List[Dict[str, Any]]) -> Dict[str, Dict[
     return stats
 
 
+<<<<<<< HEAD
 def _save_checkpoint(
     policy,
     tokenizer,
@@ -216,6 +217,13 @@ def _save_checkpoint(
             print(f"[checkpoint] Pushed checkpoint-{step} to https://huggingface.co/{hf_repo_id}")
         except Exception as e:
             print(f"[checkpoint] WARNING: HF push failed at step {step}: {e}")
+=======
+def _preview_text(text: str, max_chars: int = 400) -> str:
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3] + "..."
+>>>>>>> 623a665 (add DPO model)
 
 
 def run_grpo(
@@ -599,9 +607,181 @@ def run_grpo(
 
         return metrics
 
+<<<<<<< HEAD
     finally:
         # Always finish wandb run — even on exception or timeout
         wandb.finish()
+=======
+                response_ids_list = [
+                    gen_out[j, prompt_ids.shape[0]:]
+                    for j in range(cfg.num_samples_per_prompt)
+                ]
+
+                group_rewards: List[float] = []
+                group_lps: List[torch.Tensor] = []
+                group_ref_lps: List[torch.Tensor] = []
+
+                for k in range(cfg.num_samples_per_prompt):
+                    resp_ids = response_ids_list[k]
+                    response_text = tokenizer.decode(resp_ids, skip_special_tokens=True).strip()
+
+                    scores = score_sampled_response(
+                        prompt=q,
+                        response=response_text,
+                        prompt_condition=ptype,
+                        gold_answer=gold,
+                        stated_belief=stated,
+                    )
+
+                    factual_score = scores.get("factual_score", 0.0)
+                    endorse_flag = _to_int01(scores.get("endorse_flag", 0), default=0)
+                    overcorr_flag = _to_int01(scores.get("overcorr_flag", 0), default=0)
+
+                    r_dict = compute_reward(
+                        prompt_type=ptype,
+                        factual_score=factual_score,
+                        endorse_flag=endorse_flag,
+                        overcorr_flag=overcorr_flag,
+                        config=reward_cfg,
+                    )
+
+                    reward_value = _to_float(r_dict.get("reward", 0.0), default=0.0)
+                    factual_score_norm = r_dict.get("factual_score_norm", r_dict.get("r_factual", None))
+                    if factual_score_norm is None:
+                        fs = _to_float(factual_score, default=0.0)
+                        factual_score_norm = (fs - 1.0) / 3.0 if 1.0 <= fs <= 4.0 else fs
+                    factual_score_norm = max(0.0, min(1.0, _to_float(factual_score_norm, 0.0)))
+
+                    group_rewards.append(reward_value)
+
+                    reward_records.append(
+                        {
+                            "prompt_type": ptype,
+                            "reward": reward_value,
+                            "factual_score_norm": factual_score_norm,
+                            "endorse_flag": endorse_flag,
+                            "overcorr_flag": overcorr_flag,
+                        }
+                    )
+
+                    lp = _sequence_logprobs(policy, tokenizer, prompt_ids, resp_ids, device)
+                    with torch.no_grad():
+                        ref_lp = _sequence_logprobs(ref_policy, tokenizer, prompt_ids, resp_ids, device)
+
+                    group_lps.append(lp)
+                    group_ref_lps.append(ref_lp)
+
+                    if debug_print_samples and global_step < 3 and i == 0:
+                        print("\n=== GRPO sample preview ===")
+                        print(f"step={global_step + 1} prompt_type={ptype} sample={k + 1}/{cfg.num_samples_per_prompt}")
+                        print(f"prompt: {_preview_text(q)}")
+                        print(f"response: {_preview_text(response_text)}")
+                        print(
+                            "scores: "
+                            f"factual={factual_score} endorse={endorse_flag} "
+                            f"overcorr={overcorr_flag} reward={reward_value:.3f}"
+                        )
+                        print("===========================\n")
+
+                all_logprobs.extend(group_lps)
+                all_ref_logprobs.extend(group_ref_lps)
+                all_rewards.extend(group_rewards)
+
+                with torch.no_grad():
+                    full = torch.cat([prompt_ids, response_ids_list[0]], dim=0).unsqueeze(0)
+                    out = policy(input_ids=full)
+                    log_p = torch.log_softmax(out.logits[:, :-1], dim=-1)
+                    probs = torch.exp(log_p)
+                    ent = -(probs * log_p).sum(dim=-1).mean().item()
+                    entropies_this_batch.append(ent)
+
+            if not all_rewards:
+                print("Warning: no valid rewards in batch; skipping step.")
+                continue
+
+            logprobs = torch.stack(all_logprobs)
+            ref_logprobs = torch.stack(all_ref_logprobs)
+            rewards_tensor = torch.tensor(all_rewards, dtype=torch.float32, device=device)
+
+            rewards_reshaped = rewards_tensor.view(-1, cfg.num_samples_per_prompt)
+            group_mean = rewards_reshaped.mean(dim=1, keepdim=True)
+            group_std = rewards_reshaped.std(dim=1, keepdim=True, unbiased=False)
+            advantages = ((rewards_reshaped - group_mean) / (group_std + 1e-8)).view(-1)
+
+            policy_loss = -(logprobs * advantages.detach()).mean()
+            kl_proxy = (logprobs - ref_logprobs.detach()).mean()
+            loss = policy_loss + cfg.kl_coeff * kl_proxy
+
+            mean_entropy = sum(entropies_this_batch) / max(len(entropies_this_batch), 1)
+            mean_reward = rewards_tensor.mean().item()
+            cond_stats = _aggregate_condition_stats(reward_records)
+
+            pbar.set_postfix(
+                loss=f"{loss.item():.3f}",
+                reward=f"{mean_reward:.3f}",
+                kl=f"{kl_proxy.item():.3f}",
+                ent=f"{mean_entropy:.3f}",
+            )
+
+            # Log to wandb
+            log_dict = {
+                "loss": loss.item(),
+                "policy_loss": policy_loss.item(),
+                "kl_proxy": kl_proxy.item(),
+                "mean_reward": mean_reward,
+                "entropy": mean_entropy,
+                "lr": lr_scheduler.get_last_lr()[0],
+            }
+            for cond in ["neutral", "misconception", "correct_belief"]:
+                if cond in cond_stats:
+                    s = cond_stats[cond]
+                    log_dict[f"{cond}/mean_reward"] = s["mean_reward"]
+                    log_dict[f"{cond}/mean_factual"] = s["mean_factual"]
+                    log_dict[f"{cond}/endorse_rate"] = s["mean_endorse"]
+                    log_dict[f"{cond}/overcorr_rate"] = s["mean_overcorr"]
+            wandb.log(log_dict, step=global_step + 1)
+
+            if dry_run:
+                pbar.close()
+                print("Dry run complete; skipping backward/update.")
+                wandb.finish()
+                return {"dry_run": True}
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+            optimizer.step()
+            lr_scheduler.step()
+            global_step += 1
+            pbar.update(1)
+
+    pbar.close()
+    policy.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    print(f"Saved to {output_dir}")
+
+    wandb.finish()
+
+    metrics = {"output_dir": output_dir, "global_step": global_step}
+    hf_token = os.environ.get("HF_TOKEN")
+    if hf_repo_id and hf_token:
+        try:
+            from huggingface_hub import HfApi, login
+            login(token=hf_token)
+            api = HfApi()
+            api.create_repo(repo_id=hf_repo_id, exist_ok=True)
+            api.upload_folder(
+                folder_path=output_dir,
+                repo_id=hf_repo_id,
+                repo_type="model",
+                path_in_repo=".",
+            )
+            print(f"Pushed to https://huggingface.co/{hf_repo_id}")
+            metrics["hf_repo_id"] = hf_repo_id
+        except Exception as e:
+            raise RuntimeError(f"HF Hub push failed: {e}") from e
+    return metrics
+>>>>>>> 623a665 (add DPO model)
 
 
 def run_grpo_training() -> None:
