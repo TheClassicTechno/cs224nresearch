@@ -4,6 +4,11 @@ Sample misconception eval examples and compare SFT vs GRPO model outputs on Moda
 Run:
     modal run get_examples/modal_compare_examples.py
     modal run get_examples/modal_compare_examples.py --sample-size 7 --seed 42
+    modal run get_examples/modal_compare_examples.py --prompt-condition correct_belief
+
+Local outputs:
+    get_examples/modal_compare_examples_misconception.json
+    get_examples/modal_compare_examples_correct_belief.json
 """
 
 import json
@@ -16,11 +21,10 @@ import modal
 APP_NAME = "medquad-misconception-example-compare"
 HF_DATASET = "mli5/medquad-sycophancy"
 SPLIT_NAME = "eval"
-PROMPT_CONDITION = "misconception"
-SFT_MODEL_ID = "mli5/qwen3.5-4b-sft-medquad"
+DEFAULT_PROMPT_CONDITION = "misconception"
+ALLOWED_PROMPT_CONDITIONS = {"misconception", "correct_belief"}
+DEFAULT_SFT_MODEL_ID = "technojules/qwen3.5-2b-sft-medquad"
 GRPO_MODEL_ID = "mli5/qwen3.5-2b-grpo-medquad-new-reward-conditioned"
-OUTPUT_PATH = "/tmp/modal_compare_examples.json"
-LOCAL_OUTPUT_PATH = "get_examples/modal_compare_examples_output.json"
 GPU_TYPE = "L4"
 DEFAULT_SAMPLE_SIZE = 7
 DEFAULT_SEED = 42
@@ -35,6 +39,7 @@ image = (
         "torch",
         "transformers",
         "accelerate",
+        "peft",
         "datasets",
         "huggingface_hub",
         "tqdm",
@@ -48,6 +53,22 @@ def _validate_positive(value: int, name: str) -> None:
         raise ValueError(f"{name} must be > 0, got {value}")
 
 
+def _validate_prompt_condition(prompt_condition: str) -> None:
+    if prompt_condition not in ALLOWED_PROMPT_CONDITIONS:
+        allowed = ", ".join(sorted(ALLOWED_PROMPT_CONDITIONS))
+        raise ValueError(
+            f"prompt_condition must be one of {{{allowed}}}, got {prompt_condition!r}"
+        )
+
+
+def _remote_output_path(prompt_condition: str) -> str:
+    return f"/tmp/modal_compare_examples_{prompt_condition}.json"
+
+
+def _local_output_path(prompt_condition: str) -> str:
+    return f"get_examples/modal_compare_examples_{prompt_condition}.json"
+
+
 @app.function(
     image=image,
     gpu=GPU_TYPE,
@@ -58,16 +79,21 @@ def generate_model_comparisons(
     sample_size: int = DEFAULT_SAMPLE_SIZE,
     seed: int = DEFAULT_SEED,
     max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+    prompt_condition: str = DEFAULT_PROMPT_CONDITION,
+    sft_model_id: str = DEFAULT_SFT_MODEL_ID,
+    grpo_model_id: str = GRPO_MODEL_ID,
 ) -> dict[str, Any]:
     import gc
 
     import torch
     from datasets import load_dataset
+    from peft import AutoPeftModelForCausalLM
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from tqdm import tqdm
 
     _validate_positive(sample_size, "sample_size")
     _validate_positive(max_new_tokens, "max_new_tokens")
+    _validate_prompt_condition(prompt_condition)
 
     hf_token = os.environ.get("HF_TOKEN")
     dataset = load_dataset(HF_DATASET, split="train", token=hf_token)
@@ -79,13 +105,13 @@ def generate_model_comparisons(
             "gold_answer": row["answer"],
         }
         for idx, row in enumerate(dataset)
-        if row.get("split") == SPLIT_NAME and row.get("prompt_condition") == PROMPT_CONDITION
+        if row.get("split") == SPLIT_NAME and row.get("prompt_condition") == prompt_condition
     ]
 
     if len(examples) < sample_size:
         raise RuntimeError(
             f"Requested {sample_size} examples, but only found {len(examples)} "
-            f"{PROMPT_CONDITION} examples in the {SPLIT_NAME} split."
+            f"{prompt_condition} examples in the {SPLIT_NAME} split."
         )
 
     sampled_examples = random.Random(seed).sample(examples, sample_size)
@@ -101,13 +127,25 @@ def generate_model_comparisons(
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            token=hf_token,
-            trust_remote_code=True,
-        )
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+                token=hf_token,
+                trust_remote_code=True,
+            )
+        except ValueError as exc:
+            if "Unrecognized model" not in str(exc):
+                raise
+            print(f"Falling back to PEFT adapter loading for {model_id}")
+            model = AutoPeftModelForCausalLM.from_pretrained(
+                model_id,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+                token=hf_token,
+                trust_remote_code=True,
+            )
         model.eval()
 
         outputs_text: list[str] = []
@@ -153,8 +191,8 @@ def generate_model_comparisons(
 
         return outputs_text
 
-    sft_outputs = generate_for_model(SFT_MODEL_ID)
-    grpo_outputs = generate_for_model(GRPO_MODEL_ID)
+    sft_outputs = generate_for_model(sft_model_id)
+    grpo_outputs = generate_for_model(grpo_model_id)
 
     if len(sft_outputs) != sample_size or len(grpo_outputs) != sample_size:
         raise RuntimeError(
@@ -177,20 +215,21 @@ def generate_model_comparisons(
     result = {
         "dataset": HF_DATASET,
         "split": SPLIT_NAME,
-        "prompt_condition": PROMPT_CONDITION,
+        "prompt_condition": prompt_condition,
         "sample_size": sample_size,
         "seed": seed,
         "models": {
-            "sft": SFT_MODEL_ID,
-            "grpo": GRPO_MODEL_ID,
+            "sft": sft_model_id,
+            "grpo": grpo_model_id,
         },
         "examples": result_examples,
     }
 
-    with open(OUTPUT_PATH, "w") as f:
+    output_path = _remote_output_path(prompt_condition)
+    with open(output_path, "w") as f:
         json.dump(result, f, indent=2)
 
-    print(f"Saved comparison artifact to {OUTPUT_PATH}")
+    print(f"Saved comparison artifact to {output_path}")
     for idx, example in enumerate(result_examples, start=1):
         print(f"\n=== Example {idx} (dataset_index={example['dataset_index']}) ===")
         print(f"Prompt:\n{example['prompt']}")
@@ -206,13 +245,20 @@ def main(
     sample_size: int = DEFAULT_SAMPLE_SIZE,
     seed: int = DEFAULT_SEED,
     max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+    prompt_condition: str = DEFAULT_PROMPT_CONDITION,
+    sft_model_id: str = DEFAULT_SFT_MODEL_ID,
+    grpo_model_id: str = GRPO_MODEL_ID,
 ) -> None:
     result = generate_model_comparisons.remote(
         sample_size=sample_size,
         seed=seed,
         max_new_tokens=max_new_tokens,
+        prompt_condition=prompt_condition,
+        sft_model_id=sft_model_id,
+        grpo_model_id=grpo_model_id,
     )
-    with open(LOCAL_OUTPUT_PATH, "w") as f:
+    local_output_path = _local_output_path(prompt_condition)
+    with open(local_output_path, "w") as f:
         json.dump(result, f, indent=2)
-    print(f"Saved local artifact to {LOCAL_OUTPUT_PATH}")
+    print(f"Saved local artifact to {local_output_path}")
     print(json.dumps(result, indent=2))
